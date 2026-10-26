@@ -470,6 +470,16 @@ class AscendAttnBackend(AttentionBackend):
             and self.token_to_kv_pool.swa_layer_nums > 0
         )
 
+        if not envs.SGLANG_NPU_ATTN_BACKEND_NEEDS_CPU_SEQ_LENS.get():
+            # FIA host IntArrays consume the CPU mirror; keep it on instead of
+            # crashing later. Hybrid SWA is allowed through for dsv4 experiments.
+            if self.use_fia:
+                logger.warning(
+                    "SGLANG_NPU_ATTN_BACKEND_NEEDS_CPU_SEQ_LENS=0 is ignored: "
+                    "host-bound attention paths present; keeping the mirror."
+                )
+            else:
+                self.needs_cpu_seq_lens = False
         # head num padding
         self.padding_size_list = [1, 2, 4, 8, 16, 32, 64, 128]
         self.q_head_num_padding = None
@@ -515,39 +525,9 @@ class AscendAttnBackend(AttentionBackend):
                 )
             self.requires_host_seq_lens_update = False
 
-        # Static gate for the scheduler's per-step pinned-D2H seq_lens_cpu
-        # mirror. Device-length paths can opt out; host-bound consumers keep it.
-        _env_opt_out = not envs.SGLANG_NPU_ATTN_BACKEND_NEEDS_CPU_SEQ_LENS.get()
         # DSA models dispatch every forward mode to forward_sparse (device
         # lengths), so the MLA host-bound check does not apply to them.
         self.is_dsa_model = is_deepseek_dsa(model_runner.model_config.hf_config)
-        _host_bound = bool(
-            (self.use_mla and not self.is_dsa_model and not self.use_flash_mla)
-            or (
-                (self.use_fia or self.use_fias_v2_bsnd)
-                and not self.use_flash_mla
-                and not self.use_mojo_mtp
-            )
-            or self.is_hybrid_swa  # SWA table/mask paths read host max_len
-            or getattr(self, "use_alibi", False)  # attn_alibi consumes host lengths
-            or get_parallel().dcp_enabled  # DCP local-KV metadata is host-built
-            or get_parallel().attn_cp_size > 1  # CP attention is FIA-host-only
-            or model_runner.server_args.enable_mixed_chunk  # forward_mixed = FIA TND
-            or (
-                model_runner.spec_algorithm is not None
-                and model_runner.spec_algorithm.is_dflash_family()
-                and not self.use_flash_mla
-                and not self.use_mojo_mtp
-            )  # FIA-based DFlash/DSpark paths consume host verify lengths
-        )
-        # The scheduler ORs target and draft capabilities. Only fully supported
-        # device-length paths can skip its per-round CPU mirror.
-        self.needs_cpu_seq_lens = not (_env_opt_out and not _host_bound)
-        if _env_opt_out and _host_bound:
-            logger.warning(
-                "SGLANG_NPU_ATTN_BACKEND_NEEDS_CPU_SEQ_LENS=0 is ignored: "
-                "host-bound attention paths present; keeping the mirror."
-            )
 
     def _is_swa_layer(self, layer: RadixAttention) -> bool:
         return (
@@ -663,6 +643,8 @@ class AscendAttnBackend(AttentionBackend):
             self.graph_mode = False
             return
         # Use a supplied CPU mirror when present; device-only paths bypass it.
+        # Data-driven instead of statically gating on needs_cpu_seq_lens: when
+        # the mirror is absent (true mirrorless), fall through to the else.
         if forward_batch.seq_lens_cpu is not None and not self.use_flash_mla:
             seq_lens_max = forward_batch.seq_lens.max()
             if forward_batch.forward_mode.is_target_verify():
