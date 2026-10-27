@@ -28,6 +28,10 @@ from typing import TYPE_CHECKING
 
 import torch
 
+from sglang.srt.hardware_backend.npu.dsv4.verify_metadata import (
+    compact_verify_c4_locations,
+)
+
 if TYPE_CHECKING:
     from sglang.srt.managers.schedule_batch import Req, ScheduleBatch
 
@@ -269,7 +273,24 @@ def maybe_build_dsv4_verify_bundle(
         return torch.cat(chunks) if chunks else table.new_empty((0,))
 
     out_full_loc = batch.out_cache_loc
-    out_c4_loc = out_full_loc[(out_full_loc >= 0) & ((out_full_loc % 4) == 3)] // 4
+    # Paged allocation preserves token offsets modulo four. Its exact number
+    # of C4 writes is known from the host's live prefixes; boolean indexing
+    # would instead run Nonzero and synchronously read its device output size.
+    # Preserve the general path for unaligned pools, idle/padded rows, and
+    # callers that do not provide one full verify window per real request.
+    page_size = batch.token_to_kv_pool_allocator.page_size
+    if (
+        page_size % 4 == 0
+        and out_full_loc.numel() == len(req_indices) * int(draft_token_num)
+        and all(
+            idx > 0 and length > 0 for idx, length in zip(req_indices, live_seq_lens)
+        )
+    ):
+        out_c4_loc = compact_verify_c4_locations(
+            out_full_loc, live_seq_lens, int(draft_token_num)
+        )
+    else:
+        out_c4_loc = out_full_loc[(out_full_loc >= 0) & ((out_full_loc % 4) == 3)] // 4
     return type(reserve_bundle)(
         out_full_loc=out_full_loc,
         out_swa_loc=batch.token_to_kv_pool_allocator.translate_loc_from_full_to_swa(

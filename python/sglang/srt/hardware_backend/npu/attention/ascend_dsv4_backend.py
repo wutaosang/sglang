@@ -18,6 +18,9 @@ from sglang.kernels.ops.speculative.dspark.dspark_attn_metadata import (
 from sglang.srt.environ import envs
 from sglang.srt.hardware_backend.npu.attention.ascend_backend import AscendAttnBackend
 from sglang.srt.hardware_backend.npu.dsv4.dsv4_rope import Dsv4NpuRoPE, rope_cos_sin
+from sglang.srt.hardware_backend.npu.dsv4.verify_metadata import (
+    fill_verify_compression_metadata,
+)
 from sglang.srt.hardware_backend.npu.utils import is_npu_arch35
 from sglang.srt.layers.cp.base import get_cp_strategy
 from sglang.srt.model_executor.forward_batch_info import DSV4OutCacheLoc, ForwardMode
@@ -1647,8 +1650,18 @@ class DeepseekV4AscendAttnBackend(
 
     def _refresh_graph_target_verify_compress_1d_direct(self, ctx) -> None:
         fm = ctx.fm
-        fm.start_pos.copy_(ctx.live_seq_lens.to(torch.int32))
-        if self._is_eagle_algorithm:
+        if self._is_dspark_algorithm:
+            fill_verify_compression_metadata(
+                ctx.forward_batch.positions,
+                ctx.live_seq_lens,
+                fm.start_pos,
+                fm.seqused,
+                fm.positions_cmp_padding_c4,
+                fm.positions_cmp_padding_c128,
+                ctx.tokens_per_bs,
+            )
+        elif self._is_eagle_algorithm:
+            fm.start_pos.copy_(ctx.live_seq_lens.to(torch.int32))
             self._fill_verify_positions_cmp_padding_one_device(
                 ctx.forward_batch.positions,
                 fm.positions_cmp_padding_c4,
@@ -1664,6 +1677,7 @@ class DeepseekV4AscendAttnBackend(
                 n_draft=ctx.tokens_per_bs,
             )
         else:
+            fm.start_pos.copy_(ctx.live_seq_lens.to(torch.int32))
             verify_seq_lens_cpu = ctx.final_seq_lens_cpu
             verify_seq_lens_cpu = torch.where(
                 ctx.live_seq_lens_cpu > 0,
@@ -1684,10 +1698,11 @@ class DeepseekV4AscendAttnBackend(
                 verify_seq_lens_cpu,
                 n_draft=ctx.tokens_per_bs,
             )
-        valid = ctx.live_seq_lens[: ctx.bs] > 0
-        fm.seqused.copy_(
-            (valid.to(torch.int32) * int(ctx.tokens_per_bs)).to(device=ctx.device)
-        )
+        if not self._is_dspark_algorithm:
+            valid = ctx.live_seq_lens[: ctx.bs] > 0
+            fm.seqused.copy_(
+                (valid.to(torch.int32) * int(ctx.tokens_per_bs)).to(device=ctx.device)
+            )
         bundle = getattr(ctx.forward_batch, "out_cache_loc_dsv4", None)
         if bundle is None:
             return
