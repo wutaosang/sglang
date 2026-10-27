@@ -386,10 +386,23 @@ logger = logging.getLogger(__name__)
 #   W0_PROF_STEPS steps to sample once armed (default 20)
 # The sampler records one window and then stops, so a single run leaves one
 # trace directory per rank instead of one per scheduled step.
-_PROF_ACTIVE = [None, 0]
+# Profiler, completed decode steps, and the limit fixed when sampling starts.
+_PROF_ACTIVE = [None, 0, 0]
+_PROF_DONE = [False]
 _PROF_BS = [None]
 _PROF_ARGS = [None]
-_T_STEP = [0.0, 0]
+_T_STEP = [None, 0]
+
+
+def _positive_profiler_int(name, default):
+    value = os.environ.get(name, str(default))
+    try:
+        parsed = int(value)
+    except ValueError:
+        raise ValueError(f"{name} must be a positive integer, got {value!r}") from None
+    if parsed <= 0:
+        raise ValueError(f"{name} must be a positive integer, got {value!r}")
+    return parsed
 
 
 def _prof_bs():
@@ -397,7 +410,7 @@ def _prof_bs():
     if _PROF_BS[0] is None:
         override = os.environ.get("W0_PROF_BS")
         if override:
-            _PROF_BS[0] = int(override)
+            _PROF_BS[0] = _positive_profiler_int("W0_PROF_BS", 1)
         else:
             try:
                 sizes = getattr(_PROF_ARGS[0], "cuda_graph_bs_decode", None)
@@ -407,85 +420,100 @@ def _prof_bs():
     return _PROF_BS[0]
 
 
+def _finish_decode_profile(reason):
+    """Export once, including a short window interrupted by idle or prefill."""
+    prof = _PROF_ACTIVE[0]
+    if prof is None:
+        return
+    # A finished window must not be mistaken for a sampler that never started.
+    _PROF_ACTIVE[0] = None
+    _PROF_DONE[0] = True
+    torch.npu.synchronize()
+    prof.stop()
+    logger.warning("PROF_DONE steps=%s reason=%s", _PROF_ACTIVE[1], reason)
+
+
 def _sample_decode_step(batch, scheduler=None):
-    """Drive one profiler step for this decode batch, if sampling is armed."""
+    """Finish the previous decode step before launching the next batch."""
+    if _PROF_DONE[0]:
+        return
     out_dir = os.environ.get("W0_PROF_DIR")
-    if not out_dir:
-        return
 
-    import torch_npu
-
-    if scheduler is not None and _PROF_ARGS[0] is None:
-        _PROF_ARGS[0] = getattr(scheduler, "server_args", None)
-    if not batch.forward_mode.is_decode():
-        return
-
-    steps = int(os.environ.get("W0_PROF_STEPS", "20"))
-    if _PROF_ACTIVE[0] is None:
-        if len(batch.reqs) < _prof_bs():
-            return
-        cfg = torch_npu.profiler._ExperimentalConfig(
-            aic_metrics=torch_npu.profiler.AiCMetrics.PipeUtilization,
-            profiler_level=torch_npu.profiler.ProfilerLevel.Level2,
-            l2_cache=False,
-            data_simplification=False,
-        )
-        prof = torch_npu.profiler.profile(
-            activities=[
-                torch_npu.profiler.ProfilerActivity.CPU,
-                torch_npu.profiler.ProfilerActivity.NPU,
-            ],
-            on_trace_ready=torch_npu.profiler.tensorboard_trace_handler(out_dir),
-            record_shapes=True,
-            profile_memory=True,
-            with_stack=False,
-            with_flops=False,
-            with_modules=False,
-            experimental_config=cfg,
-        )
-        prof.start()
-        _PROF_ACTIVE[0] = prof
-        _PROF_ACTIVE[1] = 0
-        logger.warning(
-            "PROF_START stage=decode bs=%s prof_bs=%s steps=%s",
-            len(batch.reqs),
-            _prof_bs(),
-            steps,
-        )
-        return
-
-    if _PROF_ACTIVE[1] < steps:
+    if _PROF_ACTIVE[0] is not None:
         _PROF_ACTIVE[0].step()
         _PROF_ACTIVE[1] += 1
-        if _PROF_ACTIVE[1] >= steps:
-            import torch
+        if _PROF_ACTIVE[1] >= _PROF_ACTIVE[2]:
+            _finish_decode_profile("complete")
+        elif not out_dir:
+            _finish_decode_profile("disabled")
+        elif batch is None:
+            _finish_decode_profile("idle")
+        elif not batch.forward_mode.is_decode():
+            _finish_decode_profile("non_decode")
+        return
 
-            torch.npu.synchronize()
-            _PROF_ACTIVE[0].stop()
-            logger.warning("PROF_DONE steps=%s", steps)
-            _PROF_ACTIVE[0] = None
+    if not out_dir:
+        return
+    if scheduler is not None and _PROF_ARGS[0] is None:
+        _PROF_ARGS[0] = getattr(scheduler, "server_args", None)
+    if batch is None or not batch.forward_mode.is_decode():
+        return
+    if len(batch.reqs) < _prof_bs():
+        return
+
+    steps = _positive_profiler_int("W0_PROF_STEPS", 20)
+    import torch_npu
+
+    cfg = torch_npu.profiler._ExperimentalConfig(
+        aic_metrics=torch_npu.profiler.AiCMetrics.PipeUtilization,
+        profiler_level=torch_npu.profiler.ProfilerLevel.Level2,
+        l2_cache=False,
+        data_simplification=True,
+    )
+    prof = torch_npu.profiler.profile(
+        activities=[
+            torch_npu.profiler.ProfilerActivity.CPU,
+            torch_npu.profiler.ProfilerActivity.NPU,
+        ],
+        on_trace_ready=torch_npu.profiler.tensorboard_trace_handler(out_dir),
+        record_shapes=True,
+        profile_memory=True,
+        with_stack=False,
+        with_flops=False,
+        with_modules=False,
+        experimental_config=cfg,
+    )
+    prof.start()
+    _PROF_ACTIVE[:] = [prof, 0, steps]
+    logger.warning(
+        "PROF_START stage=decode bs=%s prof_bs=%s steps=%s",
+        len(batch.reqs),
+        _prof_bs(),
+        steps,
+    )
 
 
 def _time_decode_step(batch):
     """Average decode step wall time over a 20-step window."""
-    if not batch.forward_mode.is_decode():
+    if not os.environ.get("W0_PROF_DIR"):
         return
-    import time
+    if batch is None or not batch.forward_mode.is_decode():
+        _T_STEP[:] = [None, 0]
+        return
 
     now = time.perf_counter()
-    if _T_STEP[1] == 0:
+    if _T_STEP[0] is None:
         _T_STEP[0] = now
-        _T_STEP[1] = 1
         return
     _T_STEP[1] += 1
-    if _T_STEP[1] % 20 == 0:
+    if _T_STEP[1] == 20:
         logger.warning(
             "STEP_TIME decode=%.1fms bs=%s reqs=%s",
-            (now - _T_STEP[0]) * 1000.0 / 19.0,
-            batch.batch_size,
+            (now - _T_STEP[0]) * 1000.0 / _T_STEP[1],
+            batch.batch_size(),
             len(batch.reqs),
         )
-        _T_STEP[0] = now
+        _T_STEP[:] = [now, 0]
 
 
 def _prewarm_hccl_group(device, group, device_module):
@@ -2015,11 +2043,14 @@ class Scheduler(
         """A normal scheduler loop."""
         while True:
             if self.gracefully_exit:
+                _sample_decode_step(None, self)
                 break
 
             # Receive requests
             self.ingest_requests()
             if self._engine_paused:
+                _sample_decode_step(None, self)
+                _time_decode_step(None)
                 self._record_scheduler_state_for_paused_engine()
                 continue
 
@@ -2032,12 +2063,13 @@ class Scheduler(
             self.cur_batch_for_debug = batch
 
             # Launch the current batch
+            _sample_decode_step(batch, self)
             if batch:
-                _sample_decode_step(batch, self)
                 result = self.run_batch(batch)
                 _time_decode_step(batch)
                 self.process_batch_result(batch, result)
             else:
+                _time_decode_step(None)
                 # When the server is idle, do self-check and re-init some states.
                 self._sched_idled = True
                 self.on_idle()
@@ -2061,11 +2093,14 @@ class Scheduler(
 
         while True:
             if self.gracefully_exit:
+                _sample_decode_step(None, self)
                 break
 
             # Receive requests
             self.ingest_requests()
             if self._engine_paused:
+                _sample_decode_step(None, self)
+                _time_decode_step(None)
                 self._record_scheduler_state_for_paused_engine()
                 continue
 
@@ -2094,14 +2129,15 @@ class Scheduler(
                         pass
 
             # Launch the current batch
+            _sample_decode_step(batch, self)
             if batch:
-                _sample_decode_step(batch, self)
                 batch_result = self.run_batch(batch)
                 _time_decode_step(batch)
                 # Fence result processing behind this forward's shared reads.
                 self._apply_war_barrier()
                 self.result_queue.append((batch.copy(), batch_result))
             else:
+                _time_decode_step(None)
                 batch_result = None
                 self._sched_idled = True
 
