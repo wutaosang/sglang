@@ -4524,6 +4524,9 @@ class Scheduler(
             if self.enable_overlap:
                 # Self-gates on batch.spec_info.future_indices; non-spec_v2
                 # no-ops (ForwardBatch.init_new lazily computes the sum).
+                # DSV4/DSPARK 的长度同步点位于下一轮 forward 之前；上轮 accept
+                # 才决定实际提交多少 token，CPU metadata 不能提前猜测这个长度。
+                # 因而 decode 图已开启也不等于整轮无同步，具体回读见 FutureMap。
                 self.future_map.resolve_seq_lens_cpu(batch)
                 if self._confidence_budget_prepare is not None:
                     self._confidence_budget_prepare(batch, self.future_map)
@@ -4600,6 +4603,9 @@ class Scheduler(
                                 # Result D2H on copy_stream overlaps the next forward
                                 # instead of serializing on forward_stream; it's a leaf
                                 # gated by copy_done, so nothing on forward_stream waits.
+                                # 输出 token/接受结果要回到 CPU，供响应返回和请求状态更新。
+                                # NPU 也在此用独立 copy stream 异步拷贝，消费时再等事件；
+                                # 它与前面的有效长度同步回读不同，不能一概归为串行空泡。
                                 self.copy_stream.wait_stream(self.forward_stream)
                                 with self.copy_stream_ctx:
                                     batch_result.copy_to_cpu(

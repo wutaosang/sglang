@@ -253,12 +253,18 @@ def maybe_build_dsv4_verify_bundle(
     if live_seq_lens_cpu is None:
         live_seq_lens_cpu = batch.seq_lens_cpu
     if live_seq_lens_cpu is None:
+        # 显式 D2H fallback：当前 C128 区间及 C4 输出大小仍由真实前缀决定。
+        # 稳态通常复用上游镜像，但只关闭上游镜像会把同步搬到这里，不能消除依赖。
         live_seq_lens_cpu = batch.seq_lens[: len(req_indices)].cpu()
+    # 已经是 CPU tensor 时，tolist() 不回读设备；也不能用预留 KV 容量充当 live。
     live_seq_lens = live_seq_lens_cpu[: len(req_indices)].tolist()
 
     verify_lens = [int(draft_token_num)] * len(req_indices)
 
     def flatten_interval(table: torch.Tensor, ratio: int) -> torch.Tensor:
+        # 只给本轮新完成的 C128 压缩组生成写入槽，避免把提前预留的整个区间写回。
+        # CPU 按请求决定区间，再提交 arange/gather/cat 小 kernel；这是图外准备开销，
+        # 即使没有显式 D2H，设备队列也可能因 host 提交不及时而出现间隔。
         page_size = pool.c128_page_size
         chunks = []
         for req_idx, live_seq_len, verify_len in zip(
@@ -286,10 +292,14 @@ def maybe_build_dsv4_verify_bundle(
             idx > 0 and length > 0 for idx, length in zip(req_indices, live_seq_lens)
         )
     ):
+        # 已优化：CPU 已知的 live 长度给出精确输出大小，设备上稳定压缩物理槽号，
+        # 不再让 boolean indexing 为动态输出形状触发 Nonzero 的尺寸回读。
         out_c4_loc = compact_verify_c4_locations(
             out_full_loc, live_seq_lens, int(draft_token_num)
         )
     else:
+        # 一般布局仍保留原语义：设备 boolean indexing 可能隐式同步回读输出个数。
+        # C4 仅在每 4 个 token 完成一组时写入，不能把未筛选的所有 full 槽直接传入。
         out_c4_loc = out_full_loc[(out_full_loc >= 0) & ((out_full_loc % 4) == 3)] // 4
     return type(reserve_bundle)(
         out_full_loc=out_full_loc,

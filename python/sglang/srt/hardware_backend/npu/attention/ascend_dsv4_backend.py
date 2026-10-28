@@ -1492,6 +1492,9 @@ class DeepseekV4AscendAttnBackend(
 
         raw_bs = bs - num_padding
         seq_lens_cpu = forward_batch.seq_lens_cpu
+        # 当前图外路径仍在 CPU 上区分已提交前缀 live 和本轮验证后的 final，
+        # 用于压缩边界、页表范围及 draft host metadata；它们迫使上游保留镜像。
+        # 此处读取已有 CPU tensor 不是一次新的 D2H，真正的回读在 FutureMap。
         assert seq_lens_cpu is not None, "V4 graph replay requires seq_lens_cpu."
 
         device = forward_batch.seq_lens.device
@@ -1539,6 +1542,9 @@ class DeepseekV4AscendAttnBackend(
                 # seq_lens_cpu at the committed/live prefix length.
                 live_seq_lens_cpu = raw_seq_lens_cpu
                 final_seq_lens_cpu = live_seq_lens_cpu + int(tokens_per_bs)
+            # 把归一化后的真实前缀上传，供设备端位置、页表和压缩 metadata 使用。
+            # 这是图外阻塞 H2D，可能等到前面的 draft kernel 完成；移除 Nonzero 后，
+            # 原先的等待也可能转移到这里，不能把少一个同步点等同于省掉整段等待。
             live_seq_lens = live_seq_lens_cpu.to(device=device, dtype=torch.int32)
         elif (
             forward_batch.seq_lens is not None
@@ -1556,6 +1562,8 @@ class DeepseekV4AscendAttnBackend(
             graph_mode.is_target_verify() and not is_idle_replay and has_compress
         )
         compress_seq_lens = live_seq_lens
+        # CPU max 只决定页表准备范围，不发生 D2H；未来可用可靠容量上界替代，
+        # 但 attention/压缩边界仍必须使用真实有效长度，不能也改成分配容量。
         compress_seq_lens_max = int(final_seq_lens_cpu.max()) if bs > 0 else 0
         if active_target_verify:
             compress_seq_lens = final_seq_lens_cpu.to(device=device, dtype=torch.int32)
@@ -1585,6 +1593,8 @@ class DeepseekV4AscendAttnBackend(
         attn_seq_lens = ctx.live_seq_lens
         if ctx.graph_mode.is_target_verify():
             valid_verify_rows = ctx.live_seq_lens > 0
+            # verify 允许读取到 prefix + verify_width，必须刷新图绑定的设备长度。
+            # 目前从 CPU final 再做 H2D，仍可能阻塞，尚未随压缩位置融合一起消除。
             final_seq_lens = ctx.final_seq_lens_cpu.to(
                 device=ctx.device, dtype=torch.int32
             )
@@ -1601,6 +1611,8 @@ class DeepseekV4AscendAttnBackend(
             # CPU mirror of the kv buffer written below, from its CPU source — the
             # host metadata op reads this instead of a D2H sync.
             fm.seq_lens_cpu_int = ctx.final_seq_lens_cpu[: ctx.bs].int().clamp(min=1)
+        # kernel 的设备长度做最小值保护；上面的 host metadata 保留其 padding 语义。
+        # 不能把两份长度无条件互换，特别是无效请求的 0 与设备侧 clamp(min=1)。
         fm.actual_seq_lengths_kv.copy_(attn_seq_lens.clamp(min=1))
 
     def _refresh_graph_compress_page_tables_direct(self, ctx) -> None:
@@ -1651,6 +1663,9 @@ class DeepseekV4AscendAttnBackend(
     def _refresh_graph_target_verify_compress_1d_direct(self, ctx) -> None:
         fm = ctx.fm
         if self._is_dspark_algorithm:
+            # 已优化的同步点：一次设备 kernel 同时生成 C4/C128 压缩位置、start/used，
+            # 替代原 CPU 选边界再上传索引。跨越完整压缩组时才生成位置，尾部清零，
+            # 保证 KV 写入与 RoPE 使用正确的组首位置；不代表长度镜像/H2D 也已取消。
             fill_verify_compression_metadata(
                 ctx.forward_batch.positions,
                 ctx.live_seq_lens,
@@ -1755,6 +1770,8 @@ class DeepseekV4AscendAttnBackend(
             fm.block_tables_swa if fm.block_tables_swa is not None else fm.block_tables
         )
         if ctx.bs > 0:
+            # CPU 长度在此仅裁剪 SWA 页表宽度；max 本身不回读设备，
+            # 但这类消费者目前仍依赖上游 CPU 镜像，后续可改用安全容量上界。
             max_len = int(ctx.final_seq_lens_cpu.max())
             max_seq_pages = (max_len + self.page_size - 1) // self.page_size
             if 0 < max_seq_pages < swa_src.shape[1]:
@@ -1823,6 +1840,10 @@ class DeepseekV4AscendAttnBackend(
         fm.c4_topk_indices.fill_(-1)
 
     def _apply_dsv4_graph_metadata(self, forward_batch: ForwardBatch) -> None:
+        # 这些步骤在每次模型图 replay 之前执行，刷新共享缓冲区的内容而非地址。
+        # 它们保证页表、压缩位置、稀疏索引和 kernel 调度表随本轮请求变化；
+        # CPU 分支、H2D 及多个小 kernel 的提交可能留下图间空泡，完整归因需时间轴，
+        # 不能把本函数的全部 host 耗时都算成设备空闲。
         ctx = self._build_dsv4_graph_replay_ctx(forward_batch)
 
         if is_npu_arch35():
@@ -2001,6 +2022,10 @@ class DeepseekV4AscendAttnBackend(
         }
         c1a_kwargs = base_kwargs | common
         if self._is_dspark_draft_worker:
+            # host 算子按每请求的 Q/KV 工作量计算 attention 的任务划分和调度表，
+            # 并非在 CPU 上算 attention。当前 ABI 要求 CPU 长度，结果再上传到 NPU。
+            # 这里复用已回读的镜像，不会重新 D2H，但仍是上游不能关闭镜像的消费者；
+            # CPU 调度计算和返回 metadata 的 H2D 也属于图外开销。
             cu_q_cpu = fm.actual_seq_lengths_q_pa_cpu
             if cu_q_cpu is not None and cu_q_cpu.numel() > bs + 1:
                 cu_q_cpu = cu_q_cpu[: bs + 1]
@@ -2100,6 +2125,8 @@ class DeepseekV4AscendAttnBackend(
         pool = self.token_to_kv_pool
         ori_kv = pool.get_swa_buffer(layer.layer_id)
 
+        # 真正的 attention 使用设备上的 actual_seq_lengths_kv 限制可读 KV 范围。
+        # CPU 长度依赖在前面的 metadata 准备中，不是此算子调用隐式要求 CPU 长度。
         attn_kwargs = dict(
             **_sparse_attn_kv_quant_kwargs(),
             cu_seqlens_q=fm.actual_seq_lengths_q_pa,
@@ -2295,6 +2322,8 @@ class DeepseekV4AscendAttnBackend(
         if request_num == 0:
             return
         seq_lens_cpu = seq_lens_cpu[:request_num]
+        # 兼容路径需要选出刚完成 C4/C128 压缩组的 token。CPU 上 nonzero 本身
+        # 不产生 D2H；只有输入实际在设备上时，下面的 fallback 才会显式回读。
         if seq_lens_cpu.device.type != "cpu":
             seq_lens_cpu = seq_lens_cpu.cpu()
 
@@ -2310,6 +2339,9 @@ class DeepseekV4AscendAttnBackend(
         # This tiny H2D copy runs on the verify metadata path. Keep it blocking:
         # on NPU, a non-blocking copy from a short-lived pinned CPU tensor can
         # surface later as an unrelated CopyKernel stream failure.
+        # 索引上传后才能在设备上 gather 压缩组首位置；该阻塞 H2D 可能拖延 verify。
+        # 此兼容路径不能直接改为异步：还需解决上述 pinned 源的生命周期问题。
+        # DSPARK 稳态已改走融合设备 helper，避开这次小索引上传。
         indices = indices[: dst.numel()].to(device=positions.device)
         # ``indices`` selects the final token of each newly completed group.
         # The compressed KV applies RoPE at the group's first token, matching

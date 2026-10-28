@@ -535,6 +535,9 @@ class FutureMap:
         batch.seq_lens = self.new_seq_lens_buf[fi]
 
         if not self.needs_cpu_seq_lens:
+            # 只有 target、draft 及其 metadata 消费者都支持设备长度，才能走此分支。
+            # 当前 DSV4 的 graph context、C128 bundle 和 draft host metadata
+            # 仍需要 CPU 镜像，不能仅为消除同步而强制关闭该能力标记。
             # GPU gather above is kept (SB.seq_lens must advance each verify);
             # skip the .cpu() D2H. Downstream takes the GPU-only path.
             batch.seq_lens_cpu = None
@@ -547,6 +550,11 @@ class FutureMap:
             return
 
         if self.fwd_prepare_d2h_stream is None or self.publish_ready is None:
+            # DSV4/DSPARK 在当前 NPU 实现中没有上述 CUDA 专用的长度回读流，
+            # 稳态也会走这里：把 accept 后的真实有效长度同步回读给 CPU 消费者。
+            # 即使只复制几个整数，仍可能等待前序设备工作，推迟下轮 forward 提交。
+            # host 等待大多可与 NPU 计算重叠，不能把整个 .cpu() 耗时算成空泡；
+            # 预留 KV 容量也不能替代有效长度，否则 attention 可能读到未提交的位置。
             batch.seq_lens_cpu = batch.seq_lens.cpu()  # bootstrap / non-CUDA
             batch.seq_lens_sum = int(batch.seq_lens_cpu.sum())
             if _DEBUG_ASSERT:

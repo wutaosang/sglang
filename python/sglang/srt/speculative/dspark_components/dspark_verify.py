@@ -159,6 +159,9 @@ class TargetVerifyExecutor:
         if folded_accept:
             return self.verify_epilogue.read_accept(bs)
 
+        # verify 之后必须确定接受的连续前缀、bonus token 和提交长度，下一轮才能前进。
+        # 未折进模型图时，这些设备 kernel 和 TP 一致性通信在图外执行，可能增加
+        # verify 到下轮 draft 的间隔；此块本身不等于一次 CPU/D2H 同步。
         correct_len, bonus, cap_trim_lens = accept_draft_tokens(
             candidates=verify_ids_2d,
             target_logits=target_logits,
@@ -296,6 +299,9 @@ class TargetVerifyExecutor:
             live_seq_lens_cpu=batch.seq_lens_cpu,
         )
         batch.out_cache_loc = verify_cache_loc
+        # 供 target metadata 使用的 final 长度需覆盖整个 verify 块，同时单独保留
+        # 已提交的 live 前缀给压缩边界计算；否则会重复加块宽或处理到预留 KV 区间。
+        # 这些 CPU 长度运算本身没有 D2H，却仍要求上游提供准确的 CPU 镜像。
         seq_lens_cpu_backup = batch.seq_lens_cpu
         seq_lens_sum_backup = batch.seq_lens_sum
         if not self._verify_backend_self_adds_seq_lens():
@@ -334,6 +340,9 @@ class TargetVerifyExecutor:
             verify_input.candidate_max_seq_len_upper_bound = (
                 candidate_request_length_bound(batch.reqs, self.verify_num_draft_tokens)
             )
+        # 此处先在图外构造 DSV4 的 full/SWA/C4/C128 写入位置，再启动 target 图。
+        # 原 C4 Nonzero 同步位于这里的 bundle 构造中，早于 ModelRunner 的 VERIFY scope；
+        # 不能仅按 VERIFY scope 内部耗时来定位 draft 到 verify 的全部空泡。
         verify_forward_batch, _ = verify_input.prepare_for_verify(
             batch, self.target_worker
         )
@@ -363,6 +372,9 @@ class TargetVerifyExecutor:
         bs: int,
         run_compact: bool,
     ) -> None:
+        # 下一轮 draft 需要已接受 token 的 target hidden/KV，而非被拒绝候选的状态。
+        # 因此必须按 commit_lens 注入 draft KV；未折进图尾时，投影、位置处理和 KV
+        # 写入仍产生图外 kernel 提交开销，不能为缩短图间隔直接删除这段操作。
         if run_compact:
             self.kv_injector.inject_ragged(
                 batch=batch,

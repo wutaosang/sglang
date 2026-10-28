@@ -462,6 +462,9 @@ class AscendAttnBackend(AttentionBackend):
                 forward_batch.seq_lens,
                 forward_batch.out_cache_loc,
             )
+        # 图外准备每轮页表、SWA mask 和长度，模型图不会替我们刷新这些动态输入。
+        # capture 分支的 .cpu() 发生在建图阶段；普通 replay 使用已有 CPU 镜像，
+        # 其上游回读成本见 FutureMap.resolve_seq_lens_cpu，不能按此处调用次数重算。
         self._apply_cuda_graph_metadata(
             bs=bs,
             req_pool_indices=forward_batch.req_pool_indices,
@@ -779,6 +782,9 @@ class AscendAttnBackend(AttentionBackend):
             self.cuda_graph_swa_out_cache_loc[:n].copy_(
                 self.token_to_kv_pool.translate_loc_from_full_to_swa(out_cache_loc)
             )
+        # seq_lens_cpu 来自 CPU 缓冲区，这个 max().item() 本身没有 D2H。
+        # 最大长度用来裁剪本轮页表范围，后续清零尾部，防止图重用旧请求的页号；
+        # 这些图外操作会增加提交开销，但不能仅凭此行认定它是同步空泡的主因。
         max_len = seq_lens_cpu[:bs].max().item()
         if forward_mode.is_target_verify() and not _is_dflash_verify(spec_info):
             max_len += self.speculative_num_draft_tokens
@@ -808,6 +814,8 @@ class AscendAttnBackend(AttentionBackend):
                 and seq_lens_cpu is not None
             ):
                 # seq_lens_cpu may be a CPU tensor; swa_indices is on-device.
+                # mask 必须覆盖 prefix + 本轮 verify 块，所以把这份真实长度上传。
+                # 这是 H2D；阻塞上传还可能等待已排队的 kernel，并非全部耗时都在搬数据。
                 seq_lens_int = seq_lens_cpu[:bs].int().to(self.device)
             else:
                 seq_lens_int = seq_lens[:bs].int()
@@ -841,6 +849,8 @@ class AscendAttnBackend(AttentionBackend):
                     kv_lens = seq_lens_cpu[:bs]
                 else:
                     kv_lens = seq_lens[:bs]
+                # CPU 镜像存在时 .cpu() 不会再次 D2H；若 kv_lens 落到设备 fallback，
+                # 转成 Python 长度列表会强制回读，关闭镜像前也必须清理此类消费者。
                 metadata.seq_lens_cpu_list = kv_lens.cpu().int().tolist()
         elif forward_mode.is_decode_or_idle() and spec_info is not None:
             seq_lens = seq_lens + self.speculative_step_offset_npu

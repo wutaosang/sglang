@@ -468,6 +468,8 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         # plans (sync-free begin_forward that recomputes plan inputs on the
         # host every replay), and capturing one freezes the capture-time
         # plan — drafts go stale and accept length collapses to ~1.
+        # DFLASH/DSPARK 每轮仍要更新 host 驱动的计划，直接打开 glue graph 会冻结
+        # 动态输入，破坏候选/接受结果。需先清理 host 依赖，不能只开图来掩盖空泡。
         enable_metadata_glue = envs.SGLANG_ENABLE_METADATA_GLUE_GRAPH.get()
         if enable_metadata_glue and model_runner.spec_algorithm.is_dflash_family():
             logger.warning(
@@ -1453,6 +1455,9 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
                 ),
             )
         else:
+            # DSV4/DSPARK 的图外 metadata 每轮在这里刷新，完成后才可 replay 模型图。
+            # 长度处理、页表和调度表是正确读取本轮 KV 的前提，也会带来 CPU/H2D/
+            # 小 kernel 的提交开销；只开启 decode 图不会覆盖这段图间准备。
             attn_backend.init_forward_metadata_out_graph(fb_view)
 
         self.raw_bs = raw_bs

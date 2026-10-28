@@ -786,6 +786,9 @@ class DSparkWorkerV2(BaseSpecWorker):
         draft_block = proposal.draft_block
         draft_tokens = draft_block.draft_tokens
 
+        # 两段模型图之间还要准备置信度、布局和 verify 输入；这些 CPU 分支与设备
+        # 小 kernel 的提交可能造成队列断粮。static 模式只省去部分规划工作，
+        # 不能据此认为整个 draft→verify 间隔都来自 D2H 或已经被 decode 图覆盖。
         confidence = proposal.confidence
         if confidence is None:
             confidence = self._verify_planner.compute_confidence_tensor(
@@ -921,6 +924,8 @@ class DSparkWorkerV2(BaseSpecWorker):
             else:
                 on_publish(accept.new_seq_lens)
 
+        # 先发布有效长度，允许调度准备与后续状态/KV 提交重叠；发布不代表这些工作
+        # 都已完成。下轮还要遵守设备依赖，当前 NPU 的 CPU 长度回读也可能在此后等待。
         self._commit_target_mamba_states_after_verify(
             batch=batch,
             seq_lens_pre_verify=prefix_lens,

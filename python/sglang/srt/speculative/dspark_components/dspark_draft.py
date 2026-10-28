@@ -407,6 +407,10 @@ class DraftBlockProposer:
             noise_embedding = embed_module(draft_block_ids)
             draft_input_embeds = noise_embedding.view(-1, noise_embedding.shape[-1])
 
+        # draft metadata 需要看到本轮 query 块末尾，因此 CPU 镜像为有效前缀加块宽。
+        # 这段 CPU 加法不是 D2H，但下游 host metadata 的输入契约迫使上游回读长度。
+        # 改为设备长度路径时须一并改造消费者；nxt_kv_lens_cpu 可能含页对齐和预留，
+        # 不能仅为跳过回读，就假定下面 fallback 的容量与 attention 有效长度等价。
         if batch.seq_lens_cpu is not None:
             draft_seq_lens_cpu = batch.seq_lens_cpu + query_token_num
             draft_seq_lens_sum = int(draft_seq_lens_cpu.sum())

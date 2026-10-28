@@ -18,6 +18,9 @@ def compact_verify_c4_locations(
     prefix lengths, independently of the device-resident physical page IDs.
     Reserved allocation lengths must not be used for ``live_seq_lens``.
     """
+    # 输出大小只取决于 live 到 live + verify_width 跨过几个 C4 边界。
+    # 页大小按 4 对齐时，物理槽也保留这个余数；因此不用从设备 Nonzero 回读个数。
+    # 这是复用已有 CPU 长度的局部优化，尚未消除上游长度镜像的同步。
     output_size = sum(
         (length + verify_width) // 4 - length // 4 for length in live_seq_lens
     )
@@ -54,6 +57,8 @@ def fill_verify_compression_metadata(
     if positions.device.type == "npu":
         from .verify_metadata_kernels import fill_verify_compression_metadata_npu
 
+        # 把边界选择、位置压缩和尾部清零合成一次提交，既去掉原小索引 H2D，
+        # 也避免用一长串图外 PyTorch 小 kernel 替代它，再制造 host 提交空泡。
         fill_verify_compression_metadata_npu(
             positions,
             live_seq_lens,
