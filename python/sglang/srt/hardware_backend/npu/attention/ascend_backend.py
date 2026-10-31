@@ -19,7 +19,10 @@ from sglang.srt.hardware_backend.npu.attention.ascend_torch_native_backend impor
 from sglang.srt.hardware_backend.npu.attention.dsa_dcp import (
     forward_dcp_sparse_attention,
 )
-from sglang.srt.hardware_backend.npu.attention.mla_cache import gather_mla_cache_pages
+from sglang.srt.hardware_backend.npu.attention.mla_cache import (
+    build_mla_prefix_token_indices,
+    gather_mla_cache_tokens,
+)
 from sglang.srt.hardware_backend.npu.attention.mla_preprocess import (
     is_fia_nz,
     is_mla_preprocess_enabled,
@@ -122,6 +125,8 @@ class ForwardMetadata:
 
     # prefix cache
     prefix_lens: Optional[torch.Tensor] = None
+    prefix_cu_lens_cpu: Optional[List[int]] = None
+    prefix_token_indices: Optional[torch.Tensor] = None
     flatten_prefix_block_tables: Optional[torch.Tensor] = None
 
 
@@ -712,6 +717,12 @@ class AscendAttnBackend(AttentionBackend):
                 "cpu"
             )
             seq_prefix_lens = self.forward_metadata.prefix_lens.tolist()
+            self.forward_metadata.prefix_cu_lens_cpu = (
+                self.forward_metadata.prefix_lens.cumsum(0).tolist()
+            )
+            self.forward_metadata.prefix_token_indices = build_mla_prefix_token_indices(
+                seq_prefix_lens, self.page_size, device=self.device
+            )
             self.forward_metadata.flatten_prefix_block_tables = torch.empty(
                 0, dtype=torch.int32
             ).to(self.device)
@@ -2108,16 +2119,18 @@ class AscendAttnBackend(AttentionBackend):
 
                 k_buffer = self.token_to_kv_pool.get_key_buffer(layer.layer_id)
                 v_buffer = self.token_to_kv_pool.get_value_buffer(layer.layer_id)
-                kv_cached = gather_mla_cache_pages(
+                kv_cached = gather_mla_cache_tokens(
                     k_buffer,
                     self.forward_metadata.flatten_prefix_block_tables,
+                    self.forward_metadata.prefix_token_indices,
                     is_nz=is_fia_nz(),
                 )
-                k_rope_cached = gather_mla_cache_pages(
+                k_rope_cached = gather_mla_cache_tokens(
                     v_buffer,
                     self.forward_metadata.flatten_prefix_block_tables,
+                    self.forward_metadata.prefix_token_indices,
                     is_nz=is_fia_nz(),
-                ).flatten(0, 1)
+                )
 
                 assert layer.kv_b_proj is not None
                 kv = layer.kv_b_proj(kv_cached)[0].view(
@@ -2209,16 +2222,18 @@ class AscendAttnBackend(AttentionBackend):
 
                 k_buffer = self.token_to_kv_pool.get_key_buffer(layer.layer_id)
                 v_buffer = self.token_to_kv_pool.get_value_buffer(layer.layer_id)
-                kv_cached = gather_mla_cache_pages(
+                kv_cached = gather_mla_cache_tokens(
                     k_buffer,
                     self.forward_metadata.flatten_prefix_block_tables,
+                    self.forward_metadata.prefix_token_indices,
                     is_nz=is_fia_nz(),
                 )
-                k_rope_cached = gather_mla_cache_pages(
+                k_rope_cached = gather_mla_cache_tokens(
                     v_buffer,
                     self.forward_metadata.flatten_prefix_block_tables,
+                    self.forward_metadata.prefix_token_indices,
                     is_nz=is_fia_nz(),
-                ).flatten(0, 1)
+                )
 
                 assert layer.kv_b_proj is not None
                 kv = layer.kv_b_proj(kv_cached)[0].view(
@@ -2241,7 +2256,7 @@ class AscendAttnBackend(AttentionBackend):
                         num_key_value_heads=layer.tp_k_head_num,
                         input_layout="TND",
                         actual_seq_qlen=cu_query_lens,
-                        actual_seq_kvlen=prefix_lens.cumsum(0).tolist(),
+                        actual_seq_kvlen=self.forward_metadata.prefix_cu_lens_cpu,
                         sparse_mode=0,
                         softmax_scale=layer.scaling,
                         return_softmax_lse=True,
