@@ -2138,9 +2138,8 @@ class AscendAttnBackend(AttentionBackend):
                 # heads to the next power of two by duplicating the last head
                 # and slice the padding off the output.
                 num_q_heads = q_nope.shape[1]
-                pad_heads = num_q_heads
-                if num_q_heads & (num_q_heads - 1) != 0:
-                    pad_heads = 1 << (num_q_heads - 1).bit_length()
+                pad_heads = next_power_of_2(num_q_heads)
+                if pad_heads != num_q_heads:
                     extra = pad_heads - num_q_heads
                     q_nope = torch.cat(
                         (
