@@ -86,10 +86,111 @@ from sglang.srt.hardware_backend.npu.dsv4.dsv4_memory_pool import (
 from sglang.srt.hardware_backend.npu.dsv4.dsv4_req_to_token_pool import (
     DSV4ReqToTokenTablesMixin,
 )
+from sglang.srt.layers.attention.base_attn_backend import SharedReadEnds
+from sglang.srt.model_executor.forward_mode import ForwardMode
 
 _BACKEND_NPU_OPS = (
     "sglang.srt.hardware_backend.npu.attention.ascend_dsv4_backend.npu_attention_ops"
 )
+
+
+class TestWarSharedReads(unittest.TestCase):
+    def test_graph_modes_release_after_eager_metadata(self):
+        backend = DeepseekV4AscendAttnBackend.__new__(DeepseekV4AscendAttnBackend)
+        module = "sglang.srt.hardware_backend.npu.attention.ascend_dsv4_backend"
+        with patch(
+            f"{module}.get_parallel",
+            return_value=SimpleNamespace(attn_cp_size=1, attn_dcp_size=1),
+        ):
+            for mode in (
+                ForwardMode.DECODE,
+                ForwardMode.TARGET_VERIFY,
+                ForwardMode.IDLE,
+            ):
+                self.assertIs(backend.shared_read_ends(mode), SharedReadEnds.PRE_REPLAY)
+            for mode in (
+                ForwardMode.EXTEND,
+                ForwardMode.MIXED,
+                ForwardMode.DRAFT_EXTEND_V2,
+            ):
+                self.assertIs(backend.shared_read_ends(mode), SharedReadEnds.UNKNOWN)
+
+    def test_prefill_snapshots_shared_tables_and_write_locations_before_reuse(self):
+        backend = DeepseekV4AscendAttnBackend.__new__(DeepseekV4AscendAttnBackend)
+        backend.req_to_token = torch.arange(3 * 512).reshape(3, 512)
+        full_to_swa = torch.arange(3 * 512) + 4096
+        backend.token_to_kv_pool = SimpleNamespace(
+            translate_loc_from_full_to_swa=lambda loc: full_to_swa[loc]
+        )
+        backend._dsv4_state_pools_by_ratio = {
+            4: SimpleNamespace(
+                dummy_state_loc=-1,
+                translate_from_swa_loc_to_state_loc=lambda loc: loc + 8,
+            ),
+            128: SimpleNamespace(
+                dummy_state_loc=-1,
+                translate_from_req_position_to_state_loc=lambda req, pos: (
+                    req * 512 + pos
+                ),
+            ),
+        }
+        backend.forward_metadata = SimpleNamespace(
+            dsv4_explicit_state_block_tables={},
+            start_pos=torch.tensor([127, 256]),
+            actual_seq_lengths_q_pa=torch.tensor([0, 2, 5]),
+            seqused=torch.tensor([129, 259]),
+            dsv4_max_input_capacity=3,
+        )
+        batch = SimpleNamespace(
+            req_pool_indices=torch.tensor([1, 2]),
+            out_cache_loc=torch.tensor([639, 640, 1280, 1281, 1282]),
+            forward_mode=ForwardMode.EXTEND,
+        )
+        module = "sglang.srt.hardware_backend.npu.attention.ascend_dsv4_backend"
+        with (
+            patch(f"{module}.is_war_barrier_enabled", return_value=True),
+            patch(
+                f"{module}.get_parallel",
+                return_value=SimpleNamespace(attn_cp_size=1, attn_dcp_size=1),
+            ),
+        ):
+            self.assertIs(
+                backend._snapshot_prefill_shared_reads(batch), SharedReadEnds.PRE_REPLAY
+            )
+        tables = backend.forward_metadata.dsv4_explicit_state_block_tables
+        self.assertEqual(int(tables[4][0, 8]), 512 + 127 + 4096 + 8)
+        self.assertEqual(int(tables[128][0, 128]), 512 + 127)
+        snapshots = {ratio: table.clone() for ratio, table in tables.items()}
+        backend.req_to_token.fill_(-999)
+        full_to_swa.fill_(-777)
+        for ratio, table in tables.items():
+            torch.testing.assert_close(table, snapshots[ratio])
+        # Later layer cache writes must consume the snapshot even after the
+        # scheduler has repurposed both global mappings.
+        torch.testing.assert_close(
+            backend.get_swa_out_cache_loc(batch), batch.out_cache_loc + 4096
+        )
+
+    def test_disabled_and_context_parallel_paths_keep_coarse_fence(self):
+        backend = DeepseekV4AscendAttnBackend.__new__(DeepseekV4AscendAttnBackend)
+        module = "sglang.srt.hardware_backend.npu.attention.ascend_dsv4_backend"
+        with patch(f"{module}.is_war_barrier_enabled", return_value=False):
+            self.assertIs(
+                backend._snapshot_prefill_shared_reads(None), SharedReadEnds.UNKNOWN
+            )
+        with (
+            patch(f"{module}.is_war_barrier_enabled", return_value=True),
+            patch(
+                f"{module}.get_parallel",
+                return_value=SimpleNamespace(attn_cp_size=2, attn_dcp_size=1),
+            ),
+        ):
+            self.assertIs(
+                backend._snapshot_prefill_shared_reads(None), SharedReadEnds.UNKNOWN
+            )
+            self.assertIs(
+                backend.shared_read_ends(ForwardMode.DECODE), SharedReadEnds.UNKNOWN
+            )
 
 
 class TestVerifyCompressPositions(unittest.TestCase):

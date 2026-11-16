@@ -8,6 +8,7 @@ import pytest
 import torch
 
 from sglang.srt.hardware_backend.npu.graph_runner import npu_cudagraph_backend as mod
+from sglang.srt.layers.attention.base_attn_backend import SharedReadEnds
 from sglang.srt.model_executor.runner import decode_cuda_graph_runner as runner_mod
 from sglang.test.ci.ci_register import register_npu_ci
 
@@ -225,6 +226,7 @@ def test_device_length_graph_loads_inputs_and_slices_output_without_host_update(
         forward_mode=SimpleNamespace(name="TARGET_VERIFY"), seq_lens_cpu=None
     )
     with (
+        mock.patch.object(mod, "is_war_barrier_enabled", return_value=False),
         mock.patch.object(
             torch.Tensor, "cpu", side_effect=AssertionError("unexpected D2H")
         ),
@@ -238,6 +240,57 @@ def test_device_length_graph_loads_inputs_and_slices_output_without_host_update(
     graph.replay.assert_called_once_with()
     backend.replay_with_input_update.assert_not_called()
     assert actual.hidden_states.shape == (7, 16)
+
+
+@pytest.mark.parametrize("enabled", [False, True])
+@pytest.mark.parametrize(
+    "declared",
+    [SharedReadEnds.PRE_REPLAY, SharedReadEnds.IN_REPLAY, SharedReadEnds.UNKNOWN],
+)
+def test_war_event_orders_npu_replay_after_shared_reads(enabled, declared):
+    backend, runner, attention = make_backend(dspark=True, width=7, bs=1, raw_bs=1)
+    attention.needs_cpu_seq_lens = False
+    attention.shared_read_ends = mock.Mock(return_value=declared)
+    events = []
+    runner.model_runner.device_timer = None
+    runner.model_context = nullcontext
+    runner.load_batch = mock.Mock(side_effect=lambda *_: events.append("metadata"))
+    runner._replay_graph_key = "key"
+    runner.raw_num_token = 7
+    runner.is_dllm = False
+    runner.in_graph_metadata_prep_done = None
+    runner.device_module = SimpleNamespace(
+        Event=lambda: SimpleNamespace(record=lambda: events.append("event"))
+    )
+    runner._process_output_after_replay = lambda output, batch: output
+    runner.backend = backend
+    backend._graphs = {"key": SimpleNamespace(replay=lambda: events.append("replay"))}
+    backend._outputs = {
+        "key": runner_mod.LogitsProcessorOutput(
+            next_token_logits=None, hidden_states=torch.ones(7, 16)
+        )
+    }
+    backend.prepare_replay = mock.Mock(return_value=False)
+    batch = SimpleNamespace(
+        forward_mode=SimpleNamespace(name="TARGET_VERIFY"), seq_lens_cpu=None
+    )
+    with (
+        mock.patch.object(mod, "is_war_barrier_enabled", return_value=enabled),
+        mock.patch.object(runner_mod, "device_timer_ctx", return_value=nullcontext()),
+        mock.patch.object(
+            runner_mod.envs.SGLANG_LOG_DECODE_GRAPH_KEY, "get", return_value=False
+        ),
+    ):
+        runner.execute(batch)
+    expected = ["metadata", "replay"]
+    if enabled and declared is SharedReadEnds.PRE_REPLAY:
+        expected = ["metadata", "event", "replay"]
+    elif enabled and declared is SharedReadEnds.IN_REPLAY:
+        # Ordinary NPU events cannot record a marker in the captured graph.
+        expected = ["metadata", "replay", "event"]
+    assert events == expected
+    if not enabled:
+        attention.shared_read_ends.assert_not_called()
 
 
 def test_common_replay_builds_host_payload_but_dsa_skips_host_update():

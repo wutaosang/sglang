@@ -89,6 +89,12 @@ def _make_decode_runner(raw_bs=2, bs=2):
 
 
 class TestNPUCudaGraphBackend(unittest.TestCase):
+    def test_shared_read_events_follow_the_war_barrier(self):
+        backend = mod.NPUCudaGraphBackend.__new__(mod.NPUCudaGraphBackend)
+        for enabled in (False, True):
+            with mock.patch.object(mod, "is_war_barrier_enabled", return_value=enabled):
+                self.assertEqual(backend.supports_shared_read_events, enabled)
+
     def test_replay_update_converts_legacy_sequence_lengths_to_int32_tensor(self):
         backend, runner = _make_backend()
         graph = mock.Mock()

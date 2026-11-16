@@ -2143,22 +2143,38 @@ class Scheduler(
 
         if self.device == "cpu":
             self.schedule_stream.synchronize = lambda: None  # No-op for CPU
-        elif (is_cuda() or _is_hip) and (
+        elif (is_cuda() or _is_hip or _is_npu) and (
             self.enable_overlap or get_parallel().pp_size > 1
         ):
-            # CUDA/HIP streams come from a fixed round-robin pool. Redraw if this
-            # stream aliases forward_stream, which would eliminate scheduler
-            # overlap. Only CUDA/HIP streams expose a ``cuda_stream`` handle;
-            # other accelerators (e.g. NPU/XPU) skip the alias check.
+            # Pooled streams may alias. In particular, an NPU schedule stream
+            # must not inherit either the forward's work or the result copy's
+            # whole-forward wait; both would defeat an early WAR event.
             if self._gpu_work_on_forward_stream():
                 self.schedule_stream = self.forward_stream
-            elif self.schedule_stream.cuda_stream == self.forward_stream.cuda_stream:
-                self.schedule_stream = allocate_distinct_stream(
-                    self.device_module, (self.forward_stream,)
+            else:
+                handle_name = "npu_stream" if _is_npu else "cuda_stream"
+                avoid_streams = (
+                    (self.forward_stream, self.copy_stream)
+                    if _is_npu
+                    else (self.forward_stream,)
                 )
+                if getattr(self.schedule_stream, handle_name) in {
+                    getattr(stream, handle_name) for stream in avoid_streams
+                }:
+                    self.schedule_stream = allocate_distinct_stream(
+                        self.device_module,
+                        avoid_streams,
+                        handle_name=handle_name,
+                    )
         # The global WAR barrier fences the scheduler's next shared-buffer write
         # on the previous forward's read of the unified memory pool.
         self._war_barrier_enabled = is_war_barrier_enabled()
+        if _is_npu:
+            logger.info(
+                "NPU WAR barrier: enabled=%s, overlap=%s",
+                self._war_barrier_enabled,
+                self.enable_overlap,
+            )
         with self.device_module.StreamContext(self.schedule_stream):
             self.metrics_reporter.start_scheduler_time_accounting()
             dispatch_event_loop(self)

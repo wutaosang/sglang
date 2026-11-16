@@ -21,7 +21,9 @@ from sglang.srt.hardware_backend.npu.attention.ascend_backend import (
 )
 from sglang.srt.hardware_backend.npu.dsv4.dsv4_rope import Dsv4NpuRoPE, rope_cos_sin
 from sglang.srt.hardware_backend.npu.utils import is_npu_arch35
+from sglang.srt.layers.attention.base_attn_backend import SharedReadEnds
 from sglang.srt.layers.cp.base import get_cp_strategy
+from sglang.srt.managers.utils import is_war_barrier_enabled
 from sglang.srt.model_executor.forward_batch_info import DSV4OutCacheLoc
 from sglang.srt.model_executor.forward_context import get_attn_backend
 from sglang.srt.model_executor.forward_mode import ForwardMode
@@ -953,6 +955,51 @@ class C4IndexerAscendBackendMixin:
 class DeepseekV4AscendAttnBackend(
     AscendAttnBackend, C4IndexerAscendBackendMixin, CompressorAscendBackendMixin
 ):
+    def shared_read_ends(self, fm: ForwardMode) -> SharedReadEnds:
+        if fm.is_decode_or_idle() or fm.is_target_verify():
+            # Replay metadata snapshots req_to_token, C128 sidecars, the SWA
+            # mapping and compressor state tables outside the NPU graph.
+            parallel = get_parallel()
+            if parallel.attn_cp_size == parallel.attn_dcp_size == 1:
+                return SharedReadEnds.PRE_REPLAY
+        # Prefill is eligible only after _snapshot_prefill_shared_reads;
+        # hook-skipping and context-parallel paths retain a coarse barrier.
+        return SharedReadEnds.UNKNOWN
+
+    def _snapshot_prefill_shared_reads(
+        self, forward_batch: ForwardBatch
+    ) -> SharedReadEnds:
+        if not is_war_barrier_enabled():
+            return SharedReadEnds.UNKNOWN
+        parallel = get_parallel()
+        if parallel.attn_cp_size != 1 or parallel.attn_dcp_size != 1:
+            return SharedReadEnds.UNKNOWN
+        fm = self.forward_metadata
+        # store_cache/get_swa_out_cache_loc also translate full-pool locations
+        # lazily. Cache their write addresses before releasing the mapping.
+        fm.swa_loc = self.token_to_kv_pool.translate_loc_from_full_to_swa(
+            forward_batch.out_cache_loc
+        ).to(torch.int64)
+        # Eager forward_compress normally builds these lazily in the first
+        # compressed layer. Move those last shared-table reads before the
+        # prefill event; all layers then consume the private batch tables.
+        for ratio, state_pool in self._dsv4_state_pools_by_ratio.items():
+            fm.dsv4_explicit_state_block_tables[ratio] = (
+                _build_explicit_state_block_table(
+                    compress_ratio=ratio,
+                    coff=2 if ratio == 4 else 1,
+                    state_pool=state_pool,
+                    token_to_kv_pool=self.token_to_kv_pool,
+                    req_to_token=self.req_to_token,
+                    req_pool_indices=forward_batch.req_pool_indices,
+                    start_pos=fm.start_pos,
+                    cu_seqlens=fm.actual_seq_lengths_q_pa,
+                    seqused=fm.seqused,
+                    max_input_capacity=fm.dsv4_max_input_capacity,
+                )
+            )
+        return SharedReadEnds.PRE_REPLAY
+
     _DSV4_CP_LOCAL_FIELDS = (
         "actual_seq_lengths_q",
         "actual_seq_lengths_q_pa",

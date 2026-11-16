@@ -31,6 +31,7 @@ from sglang.srt.distributed.device_communicators.pynccl_allocator import (
 from sglang.srt.environ import envs
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
 from sglang.srt.hardware_backend.npu.attention.dcp import get_mla_dcp_backend
+from sglang.srt.managers.utils import is_war_barrier_enabled
 from sglang.srt.model_executor.runner.shape_key import ShapeKey
 from sglang.srt.model_executor.runner_backend.base_graph_backend import (
     BaseGraphBackend,
@@ -88,8 +89,11 @@ class NPUCudaGraphBackend(BaseGraphBackend):
 
     @property
     def supports_shared_read_events(self) -> bool:
-        # Preserve the legacy NPUGraphRunner replay behavior.
-        return False
+        # NPU backends with eager metadata can release the scheduler before
+        # replay. An IN_REPLAY declaration still falls back to POST_REPLAY:
+        # ordinary NPU events cannot mark a point inside a captured graph.
+        # Keep event creation off the default (barrier-disabled) path.
+        return is_war_barrier_enabled()
 
     @property
     def cache_loc_dtype(self):
