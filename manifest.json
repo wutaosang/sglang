@@ -1,0 +1,46 @@
+{
+  "kind": "Screenshots of archived original log excerpts",
+  "production_fix_commit": "4a169c1b0068d45a087005689b0c7644d3728bda",
+  "images": [
+    {
+      "image": "metadata-abi-failure.png",
+      "sha256": "886cf9eb1c273306c98eaa0ad294d1764fdbb2bbbfd488a5878cff47658fed77",
+      "panels": [
+        {
+          "title": "Before fix: indexer receives 2048 integers, but requires 1024",
+          "source": "evidence/attempt02/logs/server_unbounded.log",
+          "source_sha256": "b2badbb7505976a722eb07b143737aa60f387f7328e0df7fde9ddc08dc3d85b3",
+          "start_line": 420,
+          "end_line": 429
+        },
+        {
+          "title": "Regression test reproduces the incorrect li_quant_metadata allocation",
+          "source": "evidence/logs/regression_before_fix.log",
+          "source_sha256": "d2a2698f5969e59383a79de34ae4d3072f60cbf203855b55becb83119a57de25",
+          "start_line": 24,
+          "end_line": 34
+        }
+      ]
+    },
+    {
+      "image": "hccl-initialization-order.png",
+      "sha256": "567a05762fed1c25e4cfa92b9db016c94264231bc3200ccf78f260af10d16c94",
+      "panels": [
+        {
+          "title": "Negative control: metadata \u2192 first HCCL launch \u2192 metadata fails",
+          "source": "final_evidence/logs/controls_3_hccl_True.log",
+          "source_sha256": "082a201011dca80d3d74d8536f269f7391304f6ace6831fcedbb4c9ebdcf4817",
+          "start_line": 102,
+          "end_line": 111
+        },
+        {
+          "title": "Positive control: initialize HCCL on the default stream first",
+          "source": "final_evidence/logs/warm_default_1_comm_default_then_capture_True.log",
+          "source_sha256": "45e15962bb815b277355ee2eaa2271907dfd8fb9625fbab312f20fdf79901090",
+          "start_line": 27,
+          "end_line": 39
+        }
+      ]
+    }
+  ]
+}

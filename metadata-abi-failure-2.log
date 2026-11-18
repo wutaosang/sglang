@@ -1,0 +1,11 @@
+>           self.assertEqual(tuple(state.kernel_metadata[key].shape), (size,), key)
+E           AssertionError: Tuples differ: (2048,) != (1024,)
+E           
+E           First differing element 0:
+E           2048
+E           1024
+E           
+E           - (2048,)
+E           + (1024,) : li_quant_metadata
+
+test/registered/unit/npu/graph_runner/test_dsv4_prefill_graph_metadata.py:105: AssertionError

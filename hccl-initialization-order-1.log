@@ -1,0 +1,10 @@
+RuntimeError: npuSynchronizeDevice:../torch_npu/csrc/core/npu/NPUStream.cpp:748 NPU function error: AclrtSynchronizeDeviceWithTimeout, error code is 507018
+[ERROR] 2026-11-17-14:27:35 (PID:316, Device:1, RankID:-1) ERR00100 PTA call acl api failed
+[Error]: The aicpu execution is abnormal. 
+        Rectify the fault based on the error information in the ascend log.
+E39999: Internal error!
+E39999[PID: 316] 2026-11-17-14:27:35.804.639 (E39999):  The error from device(chipId:4, dieId:1), serial number is 18, an exception occurred during AICPU execution, stream_id:43, task_id:23, errcode:1, msg:execute kernel param invalid.[FUNC:ProcessStarsAicpuErrorInfo][FILE:device_error_proc.cc][LINE:1247]
+TraceBack (most recent call last):
+       An error occurred in the kernel task, retCode=0x2a, [aicpu exception].[FUNC:PreCheckTaskErr][FILE:davinci_kernel_task.cc][LINE:1030]
+       AI CPU kernel execution failed, device_id=9, stream_id=43, task_id=23, soName=15245461731410544631_5183136.so, funcName=RunCpuKernel, kernelName=SparseFlashMlaMetadata, errorCode=0x2a, paramAddr=0x12c140001000, argsSize=2634, soNameDevAddr=0x12c100016000, funcNameDevAddr=0x12c100017000, headParamOffset=0, aicpuKernelType=TS_AICPU_KERNEL_CUSTOM_AICPU(4).[FUNC:PrintAicpuErrorInfo][FILE:davinci_kernel_task.cc][LINE:734]
+       rtDeviceSynchronizeWithTimeout execution failed, reason=aicpu exception[FUNC:FuncErrorReason][FILE:error_message_manage.cc][LINE:76]

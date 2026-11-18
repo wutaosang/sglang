@@ -1,0 +1,13 @@
+META_OK 1 512
+META_OK 1 384
+META_OK 0 512
+META_OK 0 384
+CAPTURE_OK 1 comm_default_then_capture
+CAPTURE_OK 0 comm_default_then_capture
+META_OK 1 256
+META_OK 0 256
+META_OK 1 128
+META_OK 0 128
+META_OK 1 512
+META_OK 0 512
+CONTROL_PASS comm_default_then_capture expandable_segments:True

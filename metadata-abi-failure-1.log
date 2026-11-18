@@ -1,0 +1,10 @@
+[2026-11-17 12:04:05 TP6 PID911] RuntimeError: call aclnnQuantLightningIndexerV2 failed, detail:[PID: 911] 2026-11-17-12:04:05.545.097 Invalid_Argument_Tensor_Shape_Size(EZ0015): Parameter metadata of QuantLightningIndexerV2 has incorrect shape size 2048. Reason: The shape size of metadata must be 1024.
+        Solution: Check whether the shape size of input/output tensor meets the condition.
+TraceBack (most recent call last):
+        Failed to execute operator QuantLightningIndexerV2_2038. Reason: Failed to execute tiling function.
+        Check NnopbaseExecutorDoTiling(executor) failed
+        Check NnopbaseExecutorTilingAndUpdateBinInfo(executor) failed
+        Check NnopbaseExecutorMatchCache(executor) failed
+        Check NnopbaseRunForWorkspace(*executor, workspaceSize) failed
+
+Fail when using backend: breakable for prefill runner.
