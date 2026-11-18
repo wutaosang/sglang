@@ -390,6 +390,180 @@ else:
 
 logger = logging.getLogger(__name__)
 
+# Prefill/decode torch_npu.profiler sampling plus a coarse per-step timer.
+# Both are opt-in through the environment so a normal run pays nothing:
+#   W0_PROF_DIR  output directory; sampling only starts when this is set
+#   W0_PROF_STAGE decode (default) or prefill; prefill includes mixed batches
+#   W0_PROF_BS   armed batch size (default: decode graph bs, or 1 for prefill)
+#   W0_PROF_STEPS steps to sample once armed (default 20)
+# Use --skip-server-warmup to keep startup warmup out of the sampled window.
+# Health-check-only batches never arm the sampler. A stage change ends the window.
+# The sampler records one window and then stops, so a single process leaves one
+# trace directory per rank instead of one per scheduled step.
+# Profiler, completed selected-stage steps, and the limit fixed at capture start.
+_PROF_ACTIVE = [None, 0, 0]
+_PROF_DONE = [False]
+_PROF_STAGE = [None]
+_PROF_BS = [None]
+_PROF_ARGS = [None]
+_T_STEP = [None, 0]
+
+
+def _positive_profiler_int(name, default):
+    value = os.environ.get(name, str(default))
+    try:
+        parsed = int(value)
+    except ValueError:
+        raise ValueError(f"{name} must be a positive integer, got {value!r}") from None
+    if parsed <= 0:
+        raise ValueError(f"{name} must be a positive integer, got {value!r}")
+    return parsed
+
+
+def _prof_stage():
+    if _PROF_STAGE[0] is None:
+        stage = os.environ.get("W0_PROF_STAGE", "decode").strip().lower()
+        if stage not in ("decode", "prefill"):
+            raise ValueError(
+                f"W0_PROF_STAGE must be 'decode' or 'prefill', got {stage!r}"
+            )
+        _PROF_STAGE[0] = stage
+    return _PROF_STAGE[0]
+
+
+def _is_profile_batch(batch, stage):
+    if batch is None or not batch.reqs:
+        return False
+    if all(is_health_check_generate_req(req) for req in batch.reqs):
+        return False
+    if stage == "decode":
+        return batch.forward_mode.is_decode()
+    # is_prefill()/is_extend() also match TARGET_VERIFY; exclude speculative
+    # verification while retaining EXTEND, MIXED and split-prefill batches.
+    return batch.forward_mode.is_extend_without_speculative()
+
+
+def _prof_bs():
+    """Armed batch size: decode graph width, one prefill request, or override."""
+    if _PROF_BS[0] is None:
+        override = os.environ.get("W0_PROF_BS")
+        if override:
+            _PROF_BS[0] = _positive_profiler_int("W0_PROF_BS", 1)
+        elif _prof_stage() == "prefill":
+            _PROF_BS[0] = 1
+        else:
+            try:
+                sizes = getattr(_PROF_ARGS[0], "cuda_graph_bs_decode", None)
+                _PROF_BS[0] = max(sizes) if sizes else 1
+            except Exception:
+                _PROF_BS[0] = 1
+    return _PROF_BS[0]
+
+
+def _finish_profile(reason):
+    """Export once, including a short window interrupted by idle or stage change."""
+    prof = _PROF_ACTIVE[0]
+    if prof is None:
+        return
+    # A finished window must not be mistaken for a sampler that never started.
+    _PROF_ACTIVE[0] = None
+    _PROF_DONE[0] = True
+    torch.npu.synchronize()
+    prof.stop()
+    logger.warning(
+        "PROF_DONE steps=%s reason=%s stage=%s",
+        _PROF_ACTIVE[1],
+        reason,
+        _prof_stage(),
+    )
+
+
+def _sample_profile_step(batch, scheduler=None):
+    """Finish the previous sampled step before launching the next batch."""
+    if _PROF_DONE[0]:
+        return
+    out_dir = os.environ.get("W0_PROF_DIR")
+
+    if _PROF_ACTIVE[0] is not None:
+        _PROF_ACTIVE[0].step()
+        _PROF_ACTIVE[1] += 1
+        if _PROF_ACTIVE[1] >= _PROF_ACTIVE[2]:
+            _finish_profile("complete")
+        elif not out_dir:
+            _finish_profile("disabled")
+        elif batch is None:
+            _finish_profile("idle")
+        elif not _is_profile_batch(batch, _prof_stage()):
+            _finish_profile(f"non_{_prof_stage()}")
+        return
+
+    if not out_dir:
+        return
+    if scheduler is not None and _PROF_ARGS[0] is None:
+        _PROF_ARGS[0] = getattr(scheduler, "server_args", None)
+    stage = _prof_stage()
+    if not _is_profile_batch(batch, stage):
+        return
+    if len(batch.reqs) < _prof_bs():
+        return
+
+    steps = _positive_profiler_int("W0_PROF_STEPS", 20)
+    import torch_npu
+
+    cfg = torch_npu.profiler._ExperimentalConfig(
+        aic_metrics=torch_npu.profiler.AiCMetrics.PipeUtilization,
+        profiler_level=torch_npu.profiler.ProfilerLevel.Level2,
+        l2_cache=False,
+        data_simplification=True,
+    )
+    prof = torch_npu.profiler.profile(
+        activities=[
+            torch_npu.profiler.ProfilerActivity.CPU,
+            torch_npu.profiler.ProfilerActivity.NPU,
+        ],
+        on_trace_ready=torch_npu.profiler.tensorboard_trace_handler(out_dir),
+        record_shapes=True,
+        profile_memory=True,
+        with_stack=False,
+        with_flops=False,
+        with_modules=False,
+        experimental_config=cfg,
+    )
+    prof.start()
+    _PROF_ACTIVE[:] = [prof, 0, steps]
+    logger.warning(
+        "PROF_START stage=%s bs=%s prof_bs=%s steps=%s",
+        stage,
+        len(batch.reqs),
+        _prof_bs(),
+        steps,
+    )
+
+
+def _time_profile_step(batch):
+    """Average selected-stage step wall time over a 20-step window."""
+    if not os.environ.get("W0_PROF_DIR"):
+        return
+    stage = _prof_stage()
+    if not _is_profile_batch(batch, stage):
+        _T_STEP[:] = [None, 0]
+        return
+
+    now = time.perf_counter()
+    if _T_STEP[0] is None:
+        _T_STEP[0] = now
+        return
+    _T_STEP[1] += 1
+    if _T_STEP[1] == 20:
+        logger.warning(
+            "STEP_TIME %s=%.1fms bs=%s reqs=%s",
+            stage,
+            (now - _T_STEP[0]) * 1000.0 / _T_STEP[1],
+            batch.batch_size(),
+            len(batch.reqs),
+        )
+        _T_STEP[:] = [now, 0]
+
 
 def _prewarm_hccl_group(device, group, device_module):
     warmup_tensor = torch.zeros(1, dtype=torch.int32, device=device)
@@ -2037,11 +2211,14 @@ class Scheduler(
         """A normal scheduler loop."""
         while True:
             if self.gracefully_exit:
+                _sample_profile_step(None, self)
                 break
 
             # Receive requests
             self.ingest_requests()
             if self._engine_paused:
+                _sample_profile_step(None, self)
+                _time_profile_step(None)
                 self._record_scheduler_state_for_paused_engine()
                 continue
 
@@ -2054,10 +2231,13 @@ class Scheduler(
             self.cur_batch_for_debug = batch
 
             # Launch the current batch
+            _sample_profile_step(batch, self)
             if batch:
                 result = self.run_batch(batch)
+                _time_profile_step(batch)
                 self.process_batch_result(batch, result)
             else:
+                _time_profile_step(None)
                 # When the server is idle, do self-check and re-init some states.
                 self._sched_idled = True
                 self.on_idle()
@@ -2082,11 +2262,14 @@ class Scheduler(
 
         while True:
             if self.gracefully_exit:
+                _sample_profile_step(None, self)
                 break
 
             # Receive requests
             self.ingest_requests()
             if self._engine_paused:
+                _sample_profile_step(None, self)
+                _time_profile_step(None)
                 self._record_scheduler_state_for_paused_engine()
                 continue
 
@@ -2115,12 +2298,15 @@ class Scheduler(
                         pass
 
             # Launch the current batch
+            _sample_profile_step(batch, self)
             if batch:
                 batch_result = self.run_batch(batch)
+                _time_profile_step(batch)
                 # Fence result processing behind this forward's shared reads.
                 self._apply_war_barrier()
                 self.result_queue.append((batch.copy(), batch_result))
             else:
+                _time_profile_step(None)
                 batch_result = None
                 self._sched_idled = True
 
