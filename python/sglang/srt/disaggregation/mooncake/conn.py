@@ -1170,6 +1170,10 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
             )
         fully_checked = True
         for i, st in enumerate(state_types):
+            if st == StateType.DSA and registration_info.requires_dcp_relayout:
+                # The DCP sender validates the index layout it remaps.
+                fully_checked = False
+                continue
             if not self._is_generic_kvcache_state_type(st):
                 # Mamba, DSA tail and MiniMax send paths check their own layout.
                 continue
@@ -1674,16 +1678,25 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
         if self.kv_args.dsa_index_k_token_bytes is None:
             raise RuntimeError("PD DCP needs a token-shardable DSA index-K (no kpool)")
         i = state_types.index(StateType.DSA)
-        src_ptrs, dst_ptrs, _ = self.get_mla_kv_ptrs_with_pp(
-            self.kv_args.state_data_ptrs[i],
-            registration_info.dst_state_data_ptrs[i],
-            StateType.DSA,
-        )
-        src_lens, dst_lens, _ = self.get_mla_kv_ptrs_with_pp(
-            self.kv_args.state_item_lens[i],
-            registration_info.dst_state_item_lens[i],
-            StateType.DSA,
-        )
+        src_ptrs = self.kv_args.state_data_ptrs[i]
+        dst_ptrs = registration_info.dst_state_data_ptrs[i]
+        src_lens = self.kv_args.state_item_lens[i]
+        dst_lens = registration_info.dst_state_item_lens[i]
+        src_ids = self.kv_args.state_layer_ids[i]
+        dst_ids = registration_info.dst_state_layer_ids[i]
+        if src_ids or dst_ids:
+            entry_pairs = build_transfer_entry_pairs(
+                src_ids, dst_ids, len(src_ptrs), len(dst_ptrs)
+            )
+            dst_ptrs = [dst_ptrs[j] for _, j in entry_pairs]
+            dst_lens = [dst_lens[j] for _, j in entry_pairs]
+        else:
+            src_ptrs, dst_ptrs, _ = self.get_mla_kv_ptrs_with_pp(
+                src_ptrs, dst_ptrs, StateType.DSA
+            )
+            src_lens, dst_lens, _ = self.get_mla_kv_ptrs_with_pp(
+                src_lens, dst_lens, StateType.DSA
+            )
         pairs = [
             (src, dst, src_len)
             for src, dst, src_len, dst_len in zip(
@@ -2432,6 +2445,8 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                         list(indices),
                         list(dst_indices),
                         st.value,
+                        src_state_layer_ids,
+                        dst_state_layer_ids,
                     )
                     or rc
                 )
@@ -2638,20 +2653,32 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
         src_indices: list[int],
         dst_indices: list[int],
         label: str,
+        src_layer_ids: Optional[List[int]] = None,
+        dst_layer_ids: Optional[List[int]] = None,
     ) -> int:
         try:
-            dst_ptrs = slice_dsa_tail_dst_ptrs_for_pp(
-                src_ptrs,
-                dst_ptrs,
-                self.kv_args.prefill_start_layer,
-                self.kv_args.prefill_end_layer,
-            )
-            dst_item_lens = slice_dsa_tail_dst_ptrs_for_pp(
-                src_ptrs,
-                dst_item_lens,
-                self.kv_args.prefill_start_layer,
-                self.kv_args.prefill_end_layer,
-            )
+            if src_layer_ids or dst_layer_ids:
+                pairs = build_transfer_entry_pairs(
+                    src_layer_ids or [],
+                    dst_layer_ids or [],
+                    len(src_ptrs),
+                    len(dst_ptrs),
+                )
+                dst_ptrs = [dst_ptrs[j] for _, j in pairs]
+                dst_item_lens = [dst_item_lens[j] for _, j in pairs]
+            else:
+                dst_ptrs = slice_dsa_tail_dst_ptrs_for_pp(
+                    src_ptrs,
+                    dst_ptrs,
+                    self.kv_args.prefill_start_layer,
+                    self.kv_args.prefill_end_layer,
+                )
+                dst_item_lens = slice_dsa_tail_dst_ptrs_for_pp(
+                    src_ptrs,
+                    dst_item_lens,
+                    self.kv_args.prefill_start_layer,
+                    self.kv_args.prefill_end_layer,
+                )
             transfer_blocks = build_dsa_tail_transfer_blocks(
                 src_ptrs,
                 src_item_lens,

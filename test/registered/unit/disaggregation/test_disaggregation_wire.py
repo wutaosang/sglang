@@ -3709,6 +3709,77 @@ class TestDSV4DraftStateRegistration(unittest.TestCase):
 
 
 class TestAscendHybridLayerSplitMetadata(CustomTestCase):
+    def test_tail_entries_pair_by_model_layer_before_slot_remapping(self):
+        """A sparse hybrid tail must not be sliced by dense PP layer offsets."""
+        manager = object.__new__(MooncakeKVManager)
+        manager.kv_args = SimpleNamespace(prefill_start_layer=0, prefill_end_layer=20)
+        manager._transfer_data = Mock(return_value=0)
+        req = SimpleNamespace(mooncake_session_id="peer")
+        with patch(
+            "sglang.srt.disaggregation.mooncake.conn.build_dsa_tail_transfer_blocks",
+            return_value=[],
+        ) as build:
+            manager._send_slot_state(
+                req,
+                [10, 20],
+                [8, 4],
+                [30, 40, 50, 60],
+                [8, 8, 4, 4],
+                [0, 1, 2, 3, 4, 5],
+                [0, 1, 2, 3, 4, 5],
+                "DSA_TAIL",
+                [11, 11],
+                [3, 11, 3, 11],
+            )
+        build.assert_called_once_with(
+            [10, 20],
+            [8, 4],
+            [40, 60],
+            [0, 1, 2, 3, 4, 5],
+            [0, 1, 2, 3, 4, 5],
+            [8, 4],
+        )
+
+    def test_gpu_index_metadata_uses_owned_layers_and_buffer_group_order(self):
+        """GPU-owned index/scale entries must share the explicit layer-id contract."""
+        from sglang.srt.mem_cache.memory_pool import DSATokenToKVPool
+
+        pool = object.__new__(DSATokenToKVPool)
+        pool.start_layer = 3
+        pool.layer_num = 5
+        pool.layer_shard_enabled = True
+        pool._is_layer_owned = lambda i: i in (5, 6)
+        pool.get_state_buf_infos = lambda: ([10, 20, 30, 40], [8] * 4, [4] * 4)
+        self.assertEqual(pool.get_state_layer_ids(), [5, 6, 5, 6])
+
+    def test_main_kv_and_index_regions_are_disjoint(self):
+        """Packed KV and skipped index layers must retain one id per wire entry."""
+        from sglang.srt.hardware_backend.npu.memory_pool_npu import NPUMLATokenToKVPool
+
+        for packed in (False, True):
+            with self.subTest(packed=packed):
+                pool = object.__new__(NPUMLATokenToKVPool)
+                pool.start_layer = 0
+                pool.layer_num = 2
+                pool.k_buffer = torch.zeros(2, 3, 4, 1, 8)
+                pool.v_buffer = torch.zeros(2, 3, 4, 1, 4)
+                pool.index_k_buffer = torch.zeros(1, 3, 4, 1, 8)
+                pool.index_k_scale_buffer = (
+                    torch.zeros(1, 3, 4, 1, 1) if packed else None
+                )
+                pool.indexer_layer_ids = (1,)
+                pool.index_head_dim = 8
+                pool.use_combined_kv_buffer = False
+                pool.dsa_kv_cache_store_fp8 = packed
+                pool.dcp_size = 1
+                pool.is_draft_worker = False
+                main_ptrs, _, _ = pool.get_contiguous_buf_infos()
+                index_ptrs, _, _ = pool.get_state_buf_infos()
+                self.assertFalse(set(main_ptrs) & set(index_ptrs))
+                self.assertEqual(len(main_ptrs), len(pool.get_kv_layer_ids()))
+                self.assertEqual(len(index_ptrs), len(pool.get_state_layer_ids()))
+                self.assertEqual(pool.get_state_layer_ids(), [1, 1] if packed else [1])
+
     def test_owned_entries_keep_model_layer_ids(self):
         """A compact CP shard must address the same model layers as decode."""
         from sglang.srt.mem_cache.memory_pool import HybridLinearKVPool
@@ -3716,39 +3787,64 @@ class TestAscendHybridLayerSplitMetadata(CustomTestCase):
         pool = object.__new__(HybridLinearKVPool)
         pool.use_mla = True
         pool.full_attention_layer_id_mapping = {3: 0, 7: 1, 11: 2, 15: 3, 19: 4}
-        # Three buffer groups, one owned layer, fewer entries than model layers.
+        # Two main buffer groups; indexer entries travel as separate state.
         pool.full_kv_pool = SimpleNamespace(
-            get_kv_layer_ids=lambda: [2, 2, 2],
-            get_contiguous_buf_infos=lambda: ([10, 20, 30], [4096]*3, [256]*3),
+            get_kv_layer_ids=lambda: [2, 2],
+            get_contiguous_buf_infos=lambda: ([10, 20], [4096] * 2, [256] * 2),
         )
         with patch("sglang.srt.mem_cache.memory_pool._is_npu", True):
-            self.assertEqual(pool.get_kv_layer_ids(), [11, 11, 11])
+            self.assertEqual(pool.get_kv_layer_ids(), [11, 11])
         pool.full_kv_pool = SimpleNamespace(
             get_kv_layer_ids=lambda: [], get_contiguous_buf_infos=lambda: ([], [], [])
         )
         with patch("sglang.srt.mem_cache.memory_pool._is_npu", True):
             self.assertEqual(pool.get_kv_layer_ids(), [])
 
-    def test_ascend_index_entries_are_not_registered_twice(self):
-        """NPU index pages travel with KV; Mamba remains a separate state."""
+    def test_ascend_index_and_tail_have_independent_model_layer_ids(self):
+        """Sparse index entries and request tails must not use main-KV slicing."""
         from sglang.srt.hardware_backend.npu.memory_pool_npu import NPUMLATokenToKVPool
         from sglang.srt.mem_cache.static_kv_storage import _static_state_entries
 
         child = object.__new__(NPUMLATokenToKVPool)
+        child.index_head_dim = 128
         child.get_state_buf_infos = lambda: ([20], [4096], [256])
-        child.get_compress_tail_buf_infos = lambda: ([], [], [])
+        child.get_state_layer_ids = lambda: [2]
+        child.get_compress_tail_buf_infos = lambda: ([30, 40], [512, 512], [64, 64])
+        child.get_compress_tail_layer_ids = lambda: [2, 2]
         root = SimpleNamespace(
             use_dsa=True,
             full_kv_pool=child,
-            layer_router=SimpleNamespace(sub_pool=lambda _: None, wrapped_view=lambda: child),
+            full_attention_layer_id_mapping={3: 0, 7: 1, 11: 2},
+            layer_router=SimpleNamespace(
+                sub_pool=lambda _: None, wrapped_view=lambda: child
+            ),
             get_state_buf_infos=lambda: ([10], [1024], [128]),
             get_state_layer_ids=lambda: [0],
         )
         result = _static_state_entries(
             root, draft_token_to_kv_pool=None, total_kv_layers=20, state_pool=None
         )
-        self.assertEqual(len(result.wire_entries), 1)
-        self.assertNotIn(StateType.DSA, result.regions)
+        self.assertEqual(
+            [e.state_type for e in result.wire_entries],
+            [StateType.MAMBA, StateType.DSA, StateType.DSA_TAIL],
+        )
+        self.assertEqual(result.regions["state1"].ptrs, (20,))
+        self.assertEqual(result.regions["state1"].layer_ids, (11,))
+        self.assertEqual(result.regions["state2"].layer_ids, (11, 11))
+
+        # Empty CP shards must retain the same component order as decode.
+        child.get_state_buf_infos = lambda: ([], [], [])
+        child.get_state_layer_ids = lambda: []
+        child.get_compress_tail_buf_infos = lambda: ([], [], [])
+        child.get_compress_tail_layer_ids = lambda: []
+        result = _static_state_entries(
+            root, draft_token_to_kv_pool=None, total_kv_layers=20, state_pool=None
+        )
+        self.assertEqual(
+            [e.state_type for e in result.wire_entries],
+            [StateType.MAMBA, StateType.DSA],
+        )
+        self.assertEqual(result.regions["state1"].ptrs, ())
 
 
 if __name__ == "__main__":

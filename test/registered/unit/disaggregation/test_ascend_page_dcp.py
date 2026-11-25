@@ -39,25 +39,35 @@ class TestAscendPageDcpSend(CustomTestCase):
         mgr = object.__new__(AscendKVManager)
         mgr.is_hybrid_mla_backend = True
         mgr.kv_args = SimpleNamespace(
-            kv_data_ptrs=[1_000, 2_000, 3_000, 4_000, 5_000],
-            kv_layer_ids=[3, 3, 3, 16, 16],
-            kv_item_lens=[20, 8, 4, 20, 8],
+            kv_data_ptrs=[1_000, 2_000, 4_000, 5_000],
+            kv_layer_ids=[3, 3, 16, 16],
+            kv_item_lens=[20, 8, 20, 8],
             page_size=2,
             num_draft_entries=2,
             state_types=[StateType.MAMBA, StateType.DSA],
+            state_data_ptrs=[[], [3_000]],
+            state_item_lens=[[], [4]],
+            state_layer_ids=[[], [3]],
         )
-        mgr._dcp_remote_decode_layout = [False, False, True, False, False]
+        mgr.decode_kv_args_table = {
+            "decode": SimpleNamespace(
+                dst_state_data_ptrs=[[], [30_000]],
+                dst_state_item_lens=[[], [8]],
+                dst_state_layer_ids=[[], [3]],
+            )
+        }
+        mgr._dcp_remote_decode_layout = [False, False, False, False]
         self.assertEqual(
-            mgr._get_dcp_remote_decode_layout(), [False, False, True, True, True]
+            mgr._get_dcp_remote_decode_layout(), [False, False, True, True]
         )
         mgr._transfer_data = Mock(return_value=0)
         self.assertEqual(
             mgr.send_kvcache_dcp(
                 "decode",
                 np.array([5, 6, 7], dtype=np.int32),
-                [10_000, 20_000, 30_000, 40_000, 50_000],
+                [10_000, 20_000, 40_000, 50_000],
                 np.array([10, 11], dtype=np.int32),
-                dcp_token_item_lens=[10, 4, 2, 10, 4],
+                dcp_token_item_lens=[10, 4, 10, 4],
                 dst_dcp_size=2,
                 dst_dcp_rank=1,
                 src_page_offset=0,
@@ -65,7 +75,7 @@ class TestAscendPageDcpSend(CustomTestCase):
                 num_kv_tokens=6,
                 executor=None,
                 dst_layer_ids=mgr.kv_args.kv_layer_ids,
-                dst_kv_item_lens=[20, 8, 8, 40, 16],
+                dst_kv_item_lens=[20, 8, 40, 16],
             ),
             0,
         )
@@ -74,11 +84,30 @@ class TestAscendPageDcpSend(CustomTestCase):
             [
                 (1_120, 10_200, 20),
                 (2_048, 20_080, 8),
-                (3_020, 30_080, 12),
                 (4_100, 40_400, 60),
                 (5_040, 50_160, 24),
+                (3_020, 30_080, 12),
             ],
         )
+        mgr._transfer_data.reset_mock()
+        mgr.decode_kv_args_table["decode"].dst_state_item_lens[1] = [4]
+        with self.assertRaisesRegex(RuntimeError, "index state page geometry differs"):
+            mgr.send_kvcache_dcp(
+                "decode",
+                np.array([5, 6, 7], dtype=np.int32),
+                [10_000, 20_000, 40_000, 50_000],
+                np.array([10, 11], dtype=np.int32),
+                dcp_token_item_lens=[10, 4, 10, 4],
+                dst_dcp_size=2,
+                dst_dcp_rank=1,
+                src_page_offset=0,
+                decode_prefix_len=0,
+                num_kv_tokens=6,
+                executor=None,
+                dst_layer_ids=mgr.kv_args.kv_layer_ids,
+                dst_kv_item_lens=[20, 8, 40, 16],
+            )
+        mgr._transfer_data.assert_not_called()
         mgr._dcp_remote_decode_layout = []
         with self.assertRaisesRegex(RuntimeError, "layout does not match"):
             mgr._get_dcp_remote_decode_layout()

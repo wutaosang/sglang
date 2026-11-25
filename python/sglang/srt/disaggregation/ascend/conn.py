@@ -15,7 +15,10 @@ from sglang.srt.disaggregation.mooncake.conn import (
     MooncakeKVReceiver,
     MooncakeKVSender,
 )
-from sglang.srt.disaggregation.utils import resolve_dcp_dst_entry_indices
+from sglang.srt.disaggregation.utils import (
+    build_transfer_entry_pairs,
+    resolve_dcp_dst_entry_indices,
+)
 from sglang.srt.runtime_context import get_parallel
 from sglang.srt.utils.network import get_local_ip_auto
 
@@ -109,8 +112,22 @@ class AscendKVManager(MooncakeKVManager):
     def _uses_page_interleaved_dcp(self) -> bool:
         return (
             getattr(self.kv_args, "kv_buf_groups", 1) in (2, 3)
+            or (
+                getattr(self.kv_args, "kv_buf_groups", 1) == 1
+                and getattr(self.kv_args, "hidden_kv_layers", 0) > 0
+            )
             or self.is_hybrid_mla_backend
         )
+
+    def dsa_index_k_dcp_entries(self, registration_info):
+        if self._uses_page_interleaved_dcp():
+            if StateType.DSA_TAIL in self.kv_args.state_types:
+                raise RuntimeError(
+                    "Ascend PD DCP index transfer requires index_kpool=1"
+                )
+            # NPU index/scale pages keep their physical layout; no GPU packing.
+            return None
+        return super().dsa_index_k_dcp_entries(registration_info)
 
     def _requires_exact_state_index_match(self, st: StateType) -> bool:
         return (
@@ -554,6 +571,36 @@ class AscendKVManager(MooncakeKVManager):
                     )
                 )
 
+        if StateType.DSA in self.kv_args.state_types:
+            registration = self.decode_kv_args_table[mooncake_session_id]
+            i = self.kv_args.state_types.index(StateType.DSA)
+            src_ptrs = self.kv_args.state_data_ptrs[i]
+            dst_ptrs = registration.dst_state_data_ptrs[i]
+            pairs = build_transfer_entry_pairs(
+                self.kv_args.state_layer_ids[i],
+                registration.dst_state_layer_ids[i],
+                len(src_ptrs),
+                len(dst_ptrs),
+            )
+            src_groups, dst_groups = group_concurrent_contiguous(global_src, global_dst)
+            for src_entry, dst_entry in pairs:
+                page_bytes = self.kv_args.state_item_lens[i][src_entry]
+                dst_bytes = registration.dst_state_item_lens[i][dst_entry]
+                if page_bytes == 0 and dst_bytes == 0:
+                    continue
+                if dst_bytes != page_bytes * dst_dcp_size:
+                    raise RuntimeError(
+                        "Ascend DCP index state page geometry differs: "
+                        f"src={page_bytes}, dst={dst_bytes}, dcp={dst_dcp_size}"
+                    )
+                for src_group, dst_group in zip(src_groups, dst_groups):
+                    transfer_blocks.append(
+                        (
+                            src_ptrs[src_entry] + int(src_group[0]) * page_bytes,
+                            dst_ptrs[dst_entry] + int(dst_group[0]) * page_bytes,
+                            len(src_group) * page_bytes,
+                        )
+                    )
         return self._transfer_data(mooncake_session_id, transfer_blocks)
 
     def _is_generic_kvcache_state_type(self, st) -> bool:

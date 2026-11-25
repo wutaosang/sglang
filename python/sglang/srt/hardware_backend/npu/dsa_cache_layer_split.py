@@ -16,7 +16,10 @@ from typing import TYPE_CHECKING, Optional
 import torch
 
 from sglang.srt.constants import GPU_MEMORY_TYPE_KV_CACHE
-from sglang.srt.hardware_backend.npu.memory_pool_npu import NPUMLATokenToKVPool, NPUDSATokenToKVPool
+from sglang.srt.hardware_backend.npu.memory_pool_npu import (
+    NPUMLATokenToKVPool,
+    NPUDSATokenToKVPool,
+)
 from sglang.srt.layers.cp.utils import get_layer_owner, get_layer_shard_range
 from sglang.srt.mem_cache.memory_pool import unwrap_write_loc
 from sglang.srt.runtime_context import get_parallel
@@ -705,23 +708,17 @@ class LayerSplitNPUMLATokenToKVPool(NPUMLATokenToKVPool):
         owned = list(
             range(self.start_layer + owned_start, self.start_layer + owned_end)
         )
-        return owned * 2 + self.get_state_layer_ids()
+        groups = 1 if self.use_combined_kv_buffer or self.dsa_kv_cache_store_fp8 else 2
+        return owned * groups
 
     def get_kv_transfer_layer_span(self, num_entries: int) -> int:
         """Layer count covered by ``num_entries`` contiguous buf entries.
 
         ``get_contiguous_buf_infos`` reports one entry per layer per buffer
-        group (the groups of ``_get_disagg_buffer_entries``: latent k, non-fp8
-        v, indexer k, fp8 index scale), so the owned layer count is the entry
+        group (latent k and non-fp8 v), so the owned layer count is the entry
         count divided by the group count — not the raw entry count.
         """
-        groups = 1  # latent k (v stays packed into k in fp8 mode)
-        if not self.dsa_kv_cache_store_fp8:
-            groups += 1  # v
-        if self.index_head_dim is not None:
-            groups += 1  # indexer k
-            if self.index_k_scale_buffer is not None:
-                groups += 1  # fp8 index scale
+        groups = 1 if self.use_combined_kv_buffer or self.dsa_kv_cache_store_fp8 else 2
         assert groups > 0 and num_entries % groups == 0, (
             f"layer-split transfer reported {num_entries} entries, "
             f"not a multiple of {groups} buffer groups"
@@ -823,9 +820,7 @@ class LayerSplitNPUMLATokenToKVPool(NPUMLATokenToKVPool):
         torch.npu.synchronize()
 
 
-class LayerSplitNPUDSATokenToKVPool(
-    LayerSplitNPUMLATokenToKVPool, NPUDSATokenToKVPool
-):
+class LayerSplitNPUDSATokenToKVPool(LayerSplitNPUMLATokenToKVPool, NPUDSATokenToKVPool):
     """Hybrid DSA constructor/layout with the NPU layer-split storage contract.
 
     The DSA constructor translates skipped indexer layers before the common

@@ -1145,7 +1145,7 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
             buffers += list(self.index_k_scale_buffer)
         data_ptrs = [buf.data_ptr() for buf in buffers]
         data_lens = [buf.nbytes for buf in buffers]
-        item_lens = [buf[0].nbytes for buf in buffers]
+        item_lens = [buf[0].nbytes * self.dcp_size for buf in buffers]
         return data_ptrs, data_lens, item_lens
 
     def get_compress_tail_buf_infos(self):
@@ -1226,10 +1226,6 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
         entries = [(buffer, global_kv) for buffer in self.k_buffer]
         if not getattr(self, "dsa_kv_cache_store_fp8", False):
             entries += [(buffer, global_kv) for buffer in self.v_buffer]
-        if self.index_head_dim is not None:
-            entries += [(buffer, True) for buffer in self.index_k_buffer]
-            if self.index_k_scale_buffer is not None:
-                entries += [(buffer, True) for buffer in self.index_k_scale_buffer]
         return entries
 
     # for disagg
@@ -1252,16 +1248,19 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
         ]
 
     def get_kv_layer_ids(self):
-        return (
-            list(range(self.start_layer, self.start_layer + self.layer_num))
-            * (1 if self.use_combined_kv_buffer else 2)
-            + self.get_state_layer_ids()
+        return list(range(self.start_layer, self.start_layer + self.layer_num)) * (
+            1 if self.use_combined_kv_buffer or self.dsa_kv_cache_store_fp8 else 2
         )
 
     def get_state_layer_ids(self):
         return list(self.indexer_layer_ids) * (
             2 if self.index_k_scale_buffer is not None else 1
         )
+
+    def get_compress_tail_layer_ids(self):
+        if not self.kpool_use_compress:
+            return []
+        return list(range(self.start_layer, self.start_layer + self.layer_num)) * 2
 
     def _pack_dsa_fp8_kv_cache(self, cache_k, cache_v):
         latent = cache_k.reshape(-1, self.kv_lora_rank)

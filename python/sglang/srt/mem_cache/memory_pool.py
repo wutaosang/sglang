@@ -5948,6 +5948,25 @@ class DSATokenToKVPool(MLATokenToKVPool):
     def get_state_buf_infos(self):
         return self.index_key_cache.state_buf_infos()
 
+    def get_state_layer_ids(self):
+        layer_ids = list(range(self.start_layer, self.start_layer + self.layer_num))
+        if getattr(self, "layer_shard_enabled", False):
+            layer_ids = [i for i in layer_ids if self._is_layer_owned(i)]
+        ptrs, _, _ = self.get_state_buf_infos()
+        if not layer_ids:
+            assert not ptrs
+            return []
+        assert len(ptrs) % len(layer_ids) == 0
+        return layer_ids * (len(ptrs) // len(layer_ids))
+
+    def get_compress_tail_layer_ids(self):
+        ptrs, _, _ = self.get_compress_tail_buf_infos()
+        if not ptrs:
+            return []
+        layer_ids = list(range(self.start_layer, self.start_layer + self.layer_num))
+        assert len(ptrs) % len(layer_ids) == 0
+        return layer_ids * (len(ptrs) // len(layer_ids))
+
     def get_kv_size_bytes(self):
         kv_size_bytes = super().get_kv_size_bytes()
         for index_k_cache in self.index_k_with_scale_buffer:

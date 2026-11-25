@@ -968,6 +968,38 @@ def _static_state_entries(
             )
         )
 
+    def add_dsa_states(pool, model_layer_ids=None):
+        """Keep index and tail entries separate from the main token KV region."""
+        for state_type, info_method, ids_method in (
+            (StateType.DSA, "get_state_buf_infos", "get_state_layer_ids"),
+            (
+                StateType.DSA_TAIL,
+                "get_compress_tail_buf_infos",
+                "get_compress_tail_layer_ids",
+            ),
+        ):
+            ptrs, lens, item_lens = (list(x) for x in getattr(pool, info_method)())
+            layer_ids = list(getattr(pool, ids_method)())
+            if model_layer_ids is not None:
+                layer_ids = [model_layer_ids[i] for i in layer_ids]
+            if isinstance(
+                draft_token_to_kv_pool, (DSATokenToKVPool, NPUMLATokenToKVPool)
+            ):
+                draft = draft_token_to_kv_pool
+                dp, dl, di = getattr(draft, info_method)()
+                ptrs.extend(dp)
+                lens.extend(dl)
+                item_lens.extend(di)
+                layer_ids.extend(
+                    remap_draft_layer_ids(getattr(draft, ids_method)(), total_kv_layers)
+                )
+            assert len(ptrs) == len(lens) == len(item_lens) == len(layer_ids)
+            # Empty CP shards still publish the index component in wire order.
+            if ptrs or (
+                state_type == StateType.DSA and pool.index_head_dim is not None
+            ):
+                add(state_type, ptrs, lens, item_lens, layer_ids=layer_ids)
+
     if isinstance(token_to_kv_pool, MHATokenToKVPoolMXFP8):
         add(
             StateType.BLOCK_SCALE,
@@ -1082,37 +1114,11 @@ def _static_state_entries(
                 slice_outer_counts,
                 layer_ids,
             )
-            # Hybrid DSA pools keep their index cache and kpool tail in the
-            # full-attention sub-pool rather than in the Mamba state above.
-            # Ascend registers index-K alongside K/V in its KV entry groups.
-            # Registering it again as DSA state gives split ranks a different
-            # state schema from decode (including ranks owning no layers).
-            if getattr(token_to_kv_pool, "use_dsa", False) and not isinstance(
-                token_to_kv_pool.full_kv_pool, NPUMLATokenToKVPool
-            ):
-                dsa_pool = token_to_kv_pool.full_kv_pool
-                dsa_ptrs, dsa_lens, dsa_item_lens = dsa_pool.get_state_buf_infos()
-                tail_ptrs, tail_lens, tail_item_lens = (
-                    dsa_pool.get_compress_tail_buf_infos()
+            if getattr(token_to_kv_pool, "use_dsa", False):
+                add_dsa_states(
+                    token_to_kv_pool.full_kv_pool,
+                    list(token_to_kv_pool.full_attention_layer_id_mapping),
                 )
-                # The draft's index cache and tail follow the target's in the
-                # same components, as in the plain DSA branch below.
-                if isinstance(draft_token_to_kv_pool, DSATokenToKVPool):
-                    draft_ptrs, draft_lens, draft_item_lens = (
-                        draft_token_to_kv_pool.get_state_buf_infos()
-                    )
-                    dsa_ptrs = list(dsa_ptrs) + list(draft_ptrs)
-                    dsa_lens = list(dsa_lens) + list(draft_lens)
-                    dsa_item_lens = list(dsa_item_lens) + list(draft_item_lens)
-                    draft_tail_ptrs, draft_tail_lens, draft_tail_item_lens = (
-                        draft_token_to_kv_pool.get_compress_tail_buf_infos()
-                    )
-                    tail_ptrs = list(tail_ptrs) + list(draft_tail_ptrs)
-                    tail_lens = list(tail_lens) + list(draft_tail_lens)
-                    tail_item_lens = list(tail_item_lens) + list(draft_tail_item_lens)
-                add(StateType.DSA, dsa_ptrs, dsa_lens, dsa_item_lens)
-                if tail_ptrs:
-                    add(StateType.DSA_TAIL, tail_ptrs, tail_lens, tail_item_lens)
             if isinstance(token_to_kv_pool, QSATokenToKVPool):
                 qsa_ptrs, qsa_lens, qsa_item_lens = (
                     token_to_kv_pool.get_qsa_pending_state_buf_infos()
@@ -1169,34 +1175,7 @@ def _static_state_entries(
                     layer_ids=compressed_layer_ids,
                 )
         elif isinstance(token_to_kv_pool, (DSATokenToKVPool, NPUMLATokenToKVPool)):
-            tail_ptrs, tail_lens, tail_item_lens = [], [], []
-            if isinstance(token_to_kv_pool, DSATokenToKVPool):
-                tail_ptrs, tail_lens, tail_item_lens = (
-                    token_to_kv_pool.get_compress_tail_buf_infos()
-                )
-            if draft_token_to_kv_pool is not None and isinstance(
-                draft_token_to_kv_pool, DSATokenToKVPool
-            ):
-                (
-                    draft_data_ptrs,
-                    draft_data_lens,
-                    draft_item_lens,
-                ) = draft_token_to_kv_pool.get_state_buf_infos()
-                data_ptrs = data_ptrs + draft_data_ptrs
-                data_lens = data_lens + draft_data_lens
-                item_lens = item_lens + draft_item_lens
-                draft_tail_ptrs, draft_tail_lens, draft_tail_item_lens = (
-                    draft_token_to_kv_pool.get_compress_tail_buf_infos()
-                )
-                tail_ptrs = tail_ptrs + draft_tail_ptrs
-                tail_lens = tail_lens + draft_tail_lens
-                tail_item_lens = tail_item_lens + draft_tail_item_lens
-            # An NPU MLA pool sends its index and tail with the KV (PD reads
-            # its buffer groups from the pool), so it adds no state entry.
-            if not isinstance(token_to_kv_pool, NPUMLATokenToKVPool):
-                add(StateType.DSA, data_ptrs, data_lens, item_lens)
-                if tail_ptrs:
-                    add(StateType.DSA_TAIL, tail_ptrs, tail_lens, tail_item_lens)
+            add_dsa_states(token_to_kv_pool)
 
     if is_npu() and _is_dsv4_npu(token_to_kv_pool):
         from sglang.srt.disaggregation.ascend.conn import AscendStateType
