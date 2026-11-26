@@ -348,7 +348,17 @@ def maybe_prefetch_next_full_attention_kv(
     a layer-sharded pool exposing ``prefetch_kv_buffer``. Kicking the broadcast
     off one layer ahead overlaps it with the current layer's attention compute.
     """
-    if next_full_attention_layer_id is None or not dsa_use_prefill_cp(forward_batch):
+    if next_full_attention_layer_id is None:
+        return
+    # Kimi K3.1 is neither is_deepseek_dsa nor is_deepseek_v4, so
+    # dsa_use_prefill_cp() is False even while prefill CP is live. Gate on the
+    # same live metadata the KV write/get paths use.
+    cp_live = dsa_use_prefill_cp(forward_batch) or (
+        is_npu()
+        and forward_batch.attn_cp_metadata is not None
+        and forward_batch.forward_mode.is_context_parallel_extend()
+    )
+    if not cp_live:
         return
 
     if is_npu():
@@ -361,6 +371,27 @@ def maybe_prefetch_next_full_attention_kv(
         # way, so its one-layer-ahead prefix broadcast kicks here too.
         prefix_lens = forward_batch.extend_prefix_lens_cpu
         if prefix_lens is not None and all(n == 0 for n in prefix_lens):
+            # No cached prefix and the set-path patch-write seeds the remote
+            # scratch itself, so the kick delivers nothing this chunk will
+            # read. It is still issued so every rank enters the paired
+            # broadcast; the owner copy is a local memcpy, a remote rank only
+            # copies the rows below this chunk (see seed_remote_below_chunk).
+            used_bound = _dsa_split_row_bound(forward_batch)
+            pool = get_token_to_kv_pool()
+            # Model layer ids are global while the DSA child pool is indexed
+            # densely over the full-attention layers only; translate first.
+            layer_id = next_full_attention_layer_id
+            transfer = getattr(pool, "_transfer_full_attention_id", None)
+            if transfer is not None:
+                layer_id = transfer(layer_id)
+            if hasattr(pool, "full_kv_pool"):
+                pool = pool.full_kv_pool
+            prefetch_kv_buffer = getattr(pool, "prefetch_kv_buffer", None)
+            if prefetch_kv_buffer is not None:
+                prefetch_kv_buffer(layer_id, used_bound=used_bound)
+            prefetch_index_k = getattr(pool, "prefetch_index_k_buffer", None)
+            if prefetch_index_k is not None:
+                prefetch_index_k(layer_id, used_bound=used_bound)
             return
         # Radix-cache prefixes are inherited from other requests and can live
         # at arbitrary pool rows, so the row-space slice — which assumes a
@@ -372,14 +403,21 @@ def maybe_prefetch_next_full_attention_kv(
             if not get_memory().disable_radix_cache
             else _dsa_split_row_bound(forward_batch)
         )
-        prefetch_kv_buffer = getattr(get_token_to_kv_pool(), "prefetch_kv_buffer", None)
+        pool = get_token_to_kv_pool()
+        layer_id = next_full_attention_layer_id
+        transfer = getattr(pool, "_transfer_full_attention_id", None)
+        if transfer is not None:
+            layer_id = transfer(layer_id)
+        if hasattr(pool, "full_kv_pool"):
+            pool = pool.full_kv_pool
+        prefetch_kv_buffer = getattr(pool, "prefetch_kv_buffer", None)
         if prefetch_kv_buffer is not None:
-            prefetch_kv_buffer(next_full_attention_layer_id, used_bound=used_bound)
+            prefetch_kv_buffer(layer_id, used_bound=used_bound)
         prefetch_index_k = getattr(
-            get_token_to_kv_pool(), "prefetch_index_k_buffer", None
+            pool, "prefetch_index_k_buffer", None
         )
         if prefetch_index_k is not None:
-            prefetch_index_k(next_full_attention_layer_id, used_bound=used_bound)
+            prefetch_index_k(layer_id, used_bound=used_bound)
     else:
         prefetch_kv_buffer = getattr(get_token_to_kv_pool(), "prefetch_kv_buffer", None)
         if prefetch_kv_buffer is not None:

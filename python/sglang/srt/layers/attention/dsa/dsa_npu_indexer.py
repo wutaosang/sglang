@@ -531,6 +531,13 @@ class DSANPUIndexerMixin:
                 and self.dsa_enable_prefill_cp
                 and forward_batch.attn_cp_metadata is not None
             )
+            # dsa_enable_prefill_cp is False on the NPU path even when the CP
+            # metadata is live; keep the predicate on what actually shipped
+            # (same as the KV set path).
+            gather_ran = gather_ran or (
+                is_prefill and forward_batch.attn_cp_metadata is not None
+                and forward_batch.forward_mode.is_context_parallel_extend()
+            )
             pool.set_index_k_buffer(
                 layer_id,
                 indexer_cache_loc,

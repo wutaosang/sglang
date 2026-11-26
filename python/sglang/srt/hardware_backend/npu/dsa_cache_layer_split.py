@@ -32,6 +32,19 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
+class _LayerIdProxy:
+    """Expose a dense full-attention layer id while keeping layer attributes."""
+
+    __slots__ = ("layer_id", "_layer")
+
+    def __init__(self, layer, layer_id):
+        self._layer = layer
+        self.layer_id = layer_id
+
+    def __getattr__(self, name):
+        return getattr(self._layer, name)
+
+
 class LayerSplitNPUMLATokenToKVPool(NPUMLATokenToKVPool):
     """NPU MLA KV pool that shards layers across CP ranks with owner-broadcast reads.
 
@@ -232,8 +245,10 @@ class LayerSplitNPUMLATokenToKVPool(NPUMLATokenToKVPool):
         self.pending_index_works: list = []
         # Row-space bound of the current kick's broadcast: rows [0, bound)
         # below the batch's patch-write region.
-        self._kv_used_bound = 0
-        self._idx_used_bound = 0
+        self._kv_used_bound = None
+        self._idx_used_bound = None
+        self._chunk_bound_in = None
+        self._chunk_bound_out = None
 
     def get_kv_size_bytes(self):
         # Scratch storage is persistent and must be included in memory reports.
@@ -254,11 +269,11 @@ class LayerSplitNPUMLATokenToKVPool(NPUMLATokenToKVPool):
 
     def _kv_slice_tokens(self, used_bound: Optional[int]) -> int:
         """Row-space slice of the remote scratches for a bound.
-        The bound is POOL ROWS (token-major flat rows).
+        The bound is POOL ROWS (token-major flat rows), inclusive.
         """
-        if not used_bound or used_bound <= 0:
+        if used_bound is None or used_bound < 0:
             return self._kv_capacity_tokens
-        return min(used_bound, self._kv_capacity_tokens)
+        return min(used_bound + 1, self._kv_capacity_tokens)
 
     def _broadcast_kv_from_owner(self, layer_id: int, used_bound: Optional[int] = None):
         """Broadcast K and V token rows [0, slice_tokens) from the owner."""
@@ -344,6 +359,29 @@ class LayerSplitNPUMLATokenToKVPool(NPUMLATokenToKVPool):
             self.remote_index_layer_id = self.pending_remote_index_layer_id
         self.pending_remote_index_layer_id = None
 
+    def prefetch_kv_buffer(
+        self, layer_id: int, used_bound: Optional[int] = None
+    ) -> None:
+        """Kick off an async owner-broadcast of ``layer_id``'s latent KV.
+
+        The broadcast delivers the rows *below* the current chunk (the owner
+        already holds them from earlier chunks); the layer's set_kv_buffer then
+        patch-writes this chunk's rows on top. Without this kick a non-owner
+        rank's scratch would only ever hold the current chunk, so any chunked
+        prefill past the first chunk would read the previous layer's rows.
+        """
+        if self.remote_kv_layer_id == layer_id:
+            return
+        if self.pending_remote_kv_broadcast:
+            if self.pending_remote_kv_layer_id == layer_id:
+                return
+            # Wait the previous kick out before reusing the single scratch.
+            self._finalize_pending_kv_broadcast(set_remote_layer_id=False)
+        self._kv_used_bound = used_bound
+        self.pending_kv_works = self._broadcast_kv_from_owner(layer_id, used_bound)
+        self.pending_remote_kv_layer_id = layer_id
+        self.pending_remote_kv_broadcast = True
+
     def prefetch_index_k_buffer(
         self, layer_id: int, used_bound: Optional[int] = None
     ) -> None:
@@ -366,7 +404,7 @@ class LayerSplitNPUMLATokenToKVPool(NPUMLATokenToKVPool):
                 set_remote_layer_id=False, wait_works=False
             )
         # Same assign-not-max as the KV bound: row-space, per-chunk correct.
-        self._idx_used_bound = used_bound or 0
+        self._idx_used_bound = used_bound
         work = self._broadcast_index_from_owner(layer_id)
         self.pending_index_works = [work]
         self.pending_remote_index_layer_id = layer_id
@@ -377,8 +415,8 @@ class LayerSplitNPUMLATokenToKVPool(NPUMLATokenToKVPool):
         head_dim = self.index_head_dim
         cap_elems = self.remote_index_k_buffer.numel()
         cap_tokens = cap_elems // head_dim
-        if not full and self._idx_used_bound > 0:
-            n_tok = min(self._idx_used_bound, cap_tokens)
+        if not full and self._idx_used_bound is not None:
+            n_tok = min(self._idx_used_bound + 1, cap_tokens)
         else:
             n_tok = cap_tokens
         n_elems = n_tok * head_dim
@@ -396,40 +434,41 @@ class LayerSplitNPUMLATokenToKVPool(NPUMLATokenToKVPool):
             async_op=True,
         )
 
-    def prefetch_kv_buffer(
-        self,
-        layer_id: int,
-        layer_transfer_counter: Optional[LayerDoneCounter] = None,
-        layer_transfer_idx: Optional[int] = None,
-        used_bound: Optional[int] = None,
-    ) -> None:
-        """Kick off an owner-broadcast of ``layer_id``'s latent KV.
+    def note_chunk_write_bound(self, loc) -> None:
+        """Record this chunk's first..last written pool row.
 
-        One layer ahead of the read. This is the prefix-row delivery of the
-        patch-write scheme: the broadcast carries the owner's pre-write bytes
-        (prefix rows correct, this forward's new-token rows stale), and the
-        layer's ``set_kv_buffer`` (``cp_gathered_chunk=True``) scatters the
-        CP-gathered new rows on top and registers the layer so the get skips
-        the broadcast entirely. Without the set-side patch-write the pending
-        copy is discarded and the get falls back to the synchronous
-        broadcast.
+        The row-space slice helpers use the LAST row as ``used_bound``; the
+        patch-write seeding needs the FIRST row: rows below it are not
+        rewritten by this chunk.
         """
-        if self.remote_kv_layer_id == layer_id:
+        if loc is None or not hasattr(loc, "numel") or loc.numel() == 0:
+            self._chunk_bound_in = None
+            self._chunk_bound_out = None
             return
-        if self.pending_remote_kv_broadcast:
-            if self.pending_remote_kv_layer_id == layer_id:
-                return
-            self._finalize_pending_kv_broadcast(
-                set_remote_layer_id=False, wait_works=False
-            )
+        self._chunk_bound_in = int(loc.min())
+        self._chunk_bound_out = int(loc.max())
 
-        if layer_transfer_counter is not None and layer_transfer_idx is not None:
-            layer_transfer_counter.wait_until(layer_transfer_idx)
-        self._kv_used_bound = used_bound or 0
-        works = self._broadcast_kv_from_owner(layer_id, self._kv_used_bound)
-        self.pending_kv_works = works
-        self.pending_remote_kv_layer_id = layer_id
-        self.pending_remote_kv_broadcast = True
+    def seed_remote_below_chunk(self, layer_id: int) -> None:
+        """Copy the rows a chunk does not rewrite into this rank's scratch.
+
+        Only the owner holds the layer, so remote ranks reuse the rows the
+        prefix kick already delivered and keep the rest of the scratch.
+        """
+        if not self._remote_store_supported():
+            return
+        start = self._chunk_bound_in
+        if start is None or start <= 0 or start >= self._kv_capacity_tokens:
+            return
+        rows = min(start, self._kv_capacity_tokens)
+        if self._is_layer_owned(layer_id):
+            src_k = self.k_buffer[0].view(-1, self.kv_cache_dim)
+            src_v = self.v_buffer[0].view(-1, self.kr_cache_dim)
+            self.remote_k_buffer.view(-1, self.kv_cache_dim)[:rows].copy_(
+                src_k[:rows]
+            )
+            self.remote_v_buffer.view(-1, self.kr_cache_dim)[:rows].copy_(
+                src_v[:rows]
+            )
 
     def _ensure_remote_layer(self, layer_id: int) -> None:
         """Synchronously materialize ``layer_id`` in the remote scratch if remote."""
@@ -505,8 +544,13 @@ class LayerSplitNPUMLATokenToKVPool(NPUMLATokenToKVPool):
         cache_v: torch.Tensor,
         cp_gathered_full: bool = False,
         cp_gathered_chunk: bool = False,
+        layer_id_override: Optional[int] = None,
     ):
-        layer_id = layer.layer_id
+        # The hybrid wrapper hands get_kv_buffer a dense full-attention id, so
+        # the set must store under the same id or the get never hits.
+        layer_id = layer_id_override if layer_id_override is not None else layer.layer_id
+        loc, _, _ = unwrap_write_loc(loc_info)
+        self.note_chunk_write_bound(loc)
         prefix_broadcast_pending = (
             self.pending_remote_kv_broadcast
             and self.pending_remote_kv_layer_id == layer_id
@@ -517,22 +561,34 @@ class LayerSplitNPUMLATokenToKVPool(NPUMLATokenToKVPool):
         # broadcast decision stays paired across the CP group. A write
         # this layer must re-broadcast on both ranks.
         if self.pending_remote_kv_layer_id == layer_id:
-            self._finalize_pending_kv_broadcast(set_remote_layer_id=False)
+            self._finalize_pending_kv_broadcast(
+                set_remote_layer_id=not self._is_layer_owned(layer_id)
+                and self._remote_store_supported(),
+                wait_works=True,
+            )
         if self.remote_kv_layer_id == layer_id:
             self.remote_kv_layer_id = None
         if (
             cp_gathered_full
-            or (cp_gathered_chunk and (prefix_broadcast_pending or had_remote_copy))
+            or cp_gathered_chunk
+            or (prefix_broadcast_pending or had_remote_copy)
         ) and self._remote_store_supported():
             if self._is_layer_owned(layer_id):
-                super().set_kv_buffer(layer, loc_info, cache_k, cache_v)
+                super().set_kv_buffer(
+                    _LayerIdProxy(layer, layer_id), loc_info, cache_k, cache_v
+                )
                 self.remote_kv_layer_id = layer_id
             else:
-                self._store_remote_copy(layer, loc_info, cache_k, cache_v)
+                # Rows this chunk rewrites arrive with the write itself; rows
+                # below it come from the prefix kick and stay intact.
+                self.seed_remote_below_chunk(layer_id)
+                self._store_remote_copy(layer, loc_info, cache_k, cache_v, layer_id)
             return
         if not self._is_layer_owned(layer_id):
             return
-        super().set_kv_buffer(layer, loc_info, cache_k, cache_v)
+        super().set_kv_buffer(
+            _LayerIdProxy(layer, layer_id), loc_info, cache_k, cache_v
+        )
 
     def _remote_store_supported(self) -> bool:
         """Whether the remote scratch can be seeded by the CP gather path.
@@ -548,6 +604,7 @@ class LayerSplitNPUMLATokenToKVPool(NPUMLATokenToKVPool):
         loc_info: torch.Tensor,
         cache_k: torch.Tensor,
         cache_v: torch.Tensor,
+        layer_id: Optional[int] = None,
     ) -> None:
         """Cache a CP-gathered full-sequence copy into the remote scratch."""
         if self.use_combined_kv_buffer or self.use_fia_nz:
@@ -590,7 +647,7 @@ class LayerSplitNPUMLATokenToKVPool(NPUMLATokenToKVPool):
                 loc.view(-1, 1),
                 cache_v.view(-1, 1, self.qk_rope_head_dim),
             )
-        self.remote_kv_layer_id = layer.layer_id
+        self.remote_kv_layer_id = layer_id if layer_id is not None else layer.layer_id
 
     def set_index_k_buffer(
         self,

@@ -46,6 +46,7 @@ from sglang.srt.layers.cp.interleave import (
     is_interleave_extend,
 )
 from sglang.srt.layers.dcp.layout import set_dsa_shards_index_k
+from sglang.srt.layers.attention.dsa.utils import maybe_prefetch_next_full_attention_kv
 from sglang.srt.layers.dcp.planner import prepare_decode_context_parallel_metadata
 from sglang.srt.layers.dp_attention import (
     is_allocation_symmetric,
@@ -3202,6 +3203,9 @@ class KimiK3DecoderLayer(nn.Module):
         super().__init__()
         self.hidden_size = config.hidden_size
         self.layer_idx = layer_idx
+        full_ids = list(getattr(config, "full_attention_layer_ids", ()) or ())
+        later = [i for i in full_ids if i > layer_idx]
+        self._kimi_next_full_attention_layer_id = later[0] if later else None
         self._is_moe_layer = _is_moe_layer(config, layer_idx)
         # SP-MoE: with an EP a2a backend and attention TP, a MoE layer runs on
         # this rank's attention-TP shard of the rows.
@@ -3391,6 +3395,11 @@ class KimiK3DecoderLayer(nn.Module):
         )
         if isinstance(result, tuple):
             result = result[0]
+        next_full_attention_layer_id = self._kimi_next_full_attention_layer_id
+        if next_full_attention_layer_id is not None:
+            maybe_prefetch_next_full_attention_kv(
+                forward_batch, next_full_attention_layer_id
+            )
 
         if qkv_latent_func is not None:
             get_attn_tp_context().clear_attn_inputs()
@@ -3649,6 +3658,19 @@ class KimiK3LinearModel(nn.Module):
                         self.start_layer - 1, hidden_states, forward_batch
                     )
                 )
+        # Kick the first full-attention layer's owner broadcast before layer 0
+        # so it overlaps the layers that precede it instead of blocking the
+        # first attention read.
+        _first_full = next(
+            (
+                lid
+                for lid in (getattr(self.config, "full_attention_layer_ids", ()) or ())
+                if lid >= self.start_layer
+            ),
+            None,
+        )
+        if _first_full is not None:
+            maybe_prefetch_next_full_attention_kv(forward_batch, _first_full)
         for i in range(self.start_layer, self.end_layer):
             with get_global_expert_distribution_recorder().with_current_layer(i):
                 hidden_states = self.layers[i](
