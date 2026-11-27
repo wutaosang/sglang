@@ -898,14 +898,23 @@ class SchedulerDisaggregationPrefillMixin:
     @torch.no_grad()
     def event_loop_normal_disagg_prefill(self: Scheduler) -> None:
         """A normal scheduler loop for prefill worker in disaggregation mode."""
+        # Lazy import: scheduler.py imports this module for the PD loops.
+        from sglang.srt.managers.scheduler import (
+            _sample_profile_step,
+            _time_profile_step,
+        )
+
         while True:
             if self.gracefully_exit:
+                _sample_profile_step(None, self)
                 break
             self.increment_scheduler_iterations()
 
             # Receive requests
             self.ingest_requests()
             if self.pause_state.paused:
+                _sample_profile_step(None, self)
+                _time_profile_step(None)
                 self._record_scheduler_state_for_paused_engine()
                 continue
             self.disagg_prefill_bootstrap_queue.move_bootstrapped(self.waiting_queue)
@@ -922,12 +931,15 @@ class SchedulerDisaggregationPrefillMixin:
             self.cur_batch_for_debug = batch
 
             # Launch the current batch
+            _sample_profile_step(batch, self)
             if batch:
                 if self.enable_staging:
                     self.maybe_prefetch_staging_for_batch(batch)
                 result = self.run_batch(batch)
+                _time_profile_step(batch)
                 self.process_batch_result(batch, result)
             else:
+                _time_profile_step(None)
                 self._sched_idled = True
                 self.on_idle()
 
@@ -1013,6 +1025,12 @@ class SchedulerDisaggregationPrefillMixin:
         After a failed preparation, only new input or bootstrap arrivals retry
         during the wait; other readiness is checked after a result finishes.
         """
+        # Lazy import: scheduler.py imports this module for the PD loops.
+        from sglang.srt.managers.scheduler import (
+            _sample_profile_step,
+            _time_profile_step,
+        )
+
         self.enable_continuous_input_polling = (
             self._is_continuous_input_polling_enabled()
         )
@@ -1031,6 +1049,7 @@ class SchedulerDisaggregationPrefillMixin:
 
         while True:
             if self.gracefully_exit:
+                _sample_profile_step(None, self)
                 break
             self.increment_scheduler_iterations()
 
@@ -1043,6 +1062,8 @@ class SchedulerDisaggregationPrefillMixin:
                 stop_at_pause=waiting_for_batch_result
             )
             if self.pause_state.paused:
+                _sample_profile_step(None, self)
+                _time_profile_step(None)
                 self._record_scheduler_state_for_paused_engine()
                 self._yield_gil_if_needed()
                 continue
@@ -1087,10 +1108,12 @@ class SchedulerDisaggregationPrefillMixin:
                 skip_batch_creation = batch is None
 
                 # Launch the current batch
+                _sample_profile_step(batch, self)
                 if batch:
                     if self.enable_staging:
                         self.maybe_prefetch_staging_for_batch(batch)
                     batch_result = self.run_batch(batch)
+                    _time_profile_step(batch)
                     if self._war_barrier_is_coarse():
                         # Defer a whole-forward barrier past result processing: it and
                         # the transfer queue mutate no request in this forward (a
@@ -1100,6 +1123,7 @@ class SchedulerDisaggregationPrefillMixin:
                         self._apply_war_barrier()
                     self.result_queue.append((batch.copy(), batch_result))
                 else:
+                    _time_profile_step(None)
                     batch_result = None
 
             if self.last_batch:
