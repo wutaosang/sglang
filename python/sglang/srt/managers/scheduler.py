@@ -463,6 +463,7 @@ _MAX_LOGGED_RIDS = 16
 #   W0_PROF_STAGE decode (default) or prefill; prefill includes mixed batches
 #   W0_PROF_BS   armed batch size (default: decode graph bs, or 1 for prefill)
 #   W0_PROF_STEPS steps to sample once armed (default 20)
+#   W0_PROF_ARM_FILE optional sentinel created after workload warmup
 # Use --skip-server-warmup to keep startup warmup out of the sampled window.
 # Health-check-only batches never arm the sampler. A stage change ends the window.
 # The sampler records one window and then stops, so a single process leaves one
@@ -535,8 +536,13 @@ def _finish_profile(reason):
     # A finished window must not be mistaken for a sampler that never started.
     _PROF_ACTIVE[0] = None
     _PROF_DONE[0] = True
-    torch.npu.synchronize()
-    prof.stop()
+    from sglang.srt.observability.profile_analysis_npu import NPUTraceHandler
+    from sglang.srt.model_executor.step_span_utils import (
+        set_detailed_annotations_enabled,
+    )
+
+    NPUTraceHandler.stop_capture(prof, synchronize=True)
+    set_detailed_annotations_enabled(False)
     logger.warning(
         "PROF_DONE steps=%s reason=%s stage=%s",
         _PROF_ACTIVE[1],
@@ -566,6 +572,9 @@ def _sample_profile_step(batch, scheduler=None):
 
     if not out_dir:
         return
+    arm_file = os.environ.get("W0_PROF_ARM_FILE")
+    if arm_file and not os.path.isfile(arm_file):
+        return
     if scheduler is not None and _PROF_ARGS[0] is None:
         _PROF_ARGS[0] = getattr(scheduler, "server_args", None)
     stage = _prof_stage()
@@ -576,6 +585,10 @@ def _sample_profile_step(batch, scheduler=None):
 
     steps = _positive_profiler_int("W0_PROF_STEPS", 20)
     import torch_npu
+    from sglang.srt.observability.profile_analysis_npu import NPUTraceHandler
+    from sglang.srt.model_executor.step_span_utils import (
+        set_detailed_annotations_enabled,
+    )
 
     cfg = torch_npu.profiler._ExperimentalConfig(
         aic_metrics=torch_npu.profiler.AiCMetrics.PipeUtilization,
@@ -588,7 +601,7 @@ def _sample_profile_step(batch, scheduler=None):
             torch_npu.profiler.ProfilerActivity.CPU,
             torch_npu.profiler.ProfilerActivity.NPU,
         ],
-        on_trace_ready=torch_npu.profiler.tensorboard_trace_handler(out_dir),
+        on_trace_ready=NPUTraceHandler.get_on_trace_ready(out_dir),
         record_shapes=True,
         profile_memory=True,
         with_stack=False,
@@ -597,6 +610,7 @@ def _sample_profile_step(batch, scheduler=None):
         experimental_config=cfg,
     )
     prof.start()
+    set_detailed_annotations_enabled(True)
     _PROF_ACTIVE[:] = [prof, 0, steps]
     logger.warning(
         "PROF_START stage=%s bs=%s prof_bs=%s steps=%s",
