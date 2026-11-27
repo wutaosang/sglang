@@ -28,7 +28,7 @@ from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_r
 from sglang.srt.eplb.expert_location import ModelConfigForExpertLocation
 from sglang.srt.layers.layernorm import GemmaRMSNorm
 from sglang.srt.layers.linear import ReplicatedLinear
-from sglang.srt.layers.logits_processor import LogitsProcessor
+from sglang.srt.layers.logits_processor import LogitsProcessor, LogitsProcessorOutput
 from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
 from sglang.srt.layers.utils.common import add_prefix
 from sglang.srt.layers.vocab_parallel_embedding import ParallelLMHead
@@ -217,6 +217,113 @@ class Qwen3_5ForCausalLMMTP(nn.Module):
 
         self.lm_head = target_lm_head
 
+    def supports_forward_kv_only(self, *, kv_cache_dtype: torch.dtype) -> bool:
+        from sglang.srt.runtime_context import get_memory
+
+        return (
+            is_npu()
+            and envs.SGLANG_NPU_MTP_KV_ONLY_PREFILL.get()
+            and self.config.model_type == "qwen3_5_text"
+            and len(self.model.layers) == 1
+            and kv_cache_dtype in (torch.float16, torch.bfloat16)
+            and not get_memory().enable_unified_memory
+            and get_parallel().tp_size == 1
+            and get_parallel().pp_size == 1
+            and not get_parallel().attn_dp_enabled
+            and not get_parallel().enable_prefill_cp
+            and not get_parallel().dcp_enabled
+        )
+
+    def _npu_last_token_prefill(
+        self, input_ids, positions, forward_batch, hidden_states
+    ):
+        from sglang.srt.model_executor.forward_context import (
+            forward_context,
+            get_attn_backend,
+            get_forward_context,
+            get_token_to_kv_pool,
+        )
+        from sglang.srt.runtime_context import get_forward
+
+        logger.info_once(
+            "NPU MTP prefill uses full-shape KV projections and last-token attention/FFN"
+        )
+        layer = self.model.layers[0]
+        normalized = layer.input_layernorm(hidden_states)
+        qkv = layer._prepare_qkv_gate(positions, normalized, forward_batch)
+        _, k, v, _ = qkv
+        pool = get_token_to_kv_pool()
+        pool.set_kv_buffer(
+            layer.attn,
+            forward_batch.out_cache_loc,
+            k.reshape(-1, layer.num_kv_heads, layer.head_dim),
+            v.reshape(-1, layer.num_kv_heads, layer.head_dim),
+            layer.attn.k_scale,
+            layer.attn.v_scale,
+        )
+
+        # Projection shapes stay identical to the full prefill. In particular,
+        # do not change BF16 FC/QKV GEMMs from L rows to L-1 plus one row.
+        last = (
+            forward_batch.extend_start_loc + forward_batch.extend_seq_lens - 1
+        ).long()
+        fb = copy.copy(forward_batch)
+        bs = forward_batch.batch_size
+        from sglang.srt.model_executor.forward_mode import ForwardMode
+
+        # KV already includes the last position: no speculative draft offset.
+        fb.forward_mode = ForwardMode.DECODE
+        fb.spec_info = None
+        fb.input_ids = input_ids[last]
+        fb.positions = positions[last]
+        if forward_batch.mrope_positions is not None:
+            fb.mrope_positions = forward_batch.mrope_positions[:, last]
+        fb.out_cache_loc = forward_batch.out_cache_loc[last]
+        fb.extend_num_tokens = bs
+        fb.extend_seq_lens = torch.ones(bs, dtype=torch.int32, device=input_ids.device)
+        fb.extend_prefix_lens = forward_batch.seq_lens - 1
+        fb.extend_seq_lens_cpu = [1] * bs
+        fb.extend_prefix_lens_cpu = (forward_batch.seq_lens_cpu - 1).tolist()
+        fb.extend_start_loc = torch.arange(
+            bs, dtype=torch.int32, device=input_ids.device
+        )
+        fb.global_num_token_non_padded_cpu = bs
+        if fb.global_num_token_non_padded is not None:
+            fb.global_num_token_non_padded = torch.full_like(
+                fb.global_num_token_non_padded, bs
+            )
+        if fb.num_token_non_padded is not None:
+            fb.num_token_non_padded = torch.full_like(fb.num_token_non_padded, bs)
+        fb._qwen_mtp_qkv = tuple(
+            value[last] if value is not None else None for value in qkv
+        )
+        get_attn_backend().init_forward_metadata(fb)
+        with (
+            get_forward().scoped(forward_batch=fb),
+            forward_context(get_forward_context(), forward_batch=fb),
+        ):
+            result = self.model(fb.input_ids, fb.positions, fb, hidden_states[last])
+            return self.logits_processor(fb.input_ids, result, self.lm_head, fb)
+
+    def _forward_kv_only(self, hidden_states, positions, forward_batch):
+        from sglang.srt.model_executor.forward_context import get_token_to_kv_pool
+
+        logger.info_once("NPU Qwen MTP KV-only prefill is active")
+        layer = self.model.layers[0]
+        hidden_states = layer.input_layernorm(hidden_states)
+        if getattr(layer.rotary_emb, "mrope_section", None):
+            positions = forward_batch.mrope_positions
+        _, k, v, _ = layer._prepare_qkv_gate(positions, hidden_states, forward_batch)
+        get_token_to_kv_pool().set_kv_buffer(
+            layer.attn,
+            forward_batch.out_cache_loc,
+            k.reshape(-1, layer.num_kv_heads, layer.head_dim),
+            v.reshape(-1, layer.num_kv_heads, layer.head_dim),
+            layer.attn.k_scale,
+            layer.attn.v_scale,
+        )
+        return LogitsProcessorOutput(next_token_logits=None)
+
     @torch.no_grad()
     def forward(
         self,
@@ -280,6 +387,99 @@ class Qwen3_5ForCausalLMMTP(nn.Module):
                 )
             else:
                 hidden_states, _ = self.fc(hidden_states)
+
+            if getattr(forward_batch.spec_info, "kv_only", False):
+                return self._forward_kv_only(hidden_states, positions, forward_batch)
+
+            if getattr(forward_batch, "_qwen_mtp_last_token_only", False):
+                reference = None
+                if envs.SGLANG_NPU_VALIDATE_LATENCY_PATHS.get():
+                    from sglang.srt.hardware_backend.npu.latency_validation import (
+                        capture_mtp_stages,
+                    )
+                    from sglang.srt.model_executor.forward_context import (
+                        get_token_to_kv_pool,
+                    )
+
+                    last_rows = (
+                        forward_batch.extend_start_loc
+                        + forward_batch.extend_seq_lens
+                        - 1
+                    ).long()
+                    with capture_mtp_stages(self.model, last_rows) as reference_stages:
+                        full_hidden = self.model(
+                            input_ids, positions, forward_batch, hidden_states.clone()
+                        )
+                    full_output = self.logits_processor(
+                        input_ids, full_hidden, self.lm_head, forward_batch
+                    )
+                    pool = get_token_to_kv_pool()
+                    layer_id = self.model.layers[0].attn.layer_id
+                    reference = (
+                        pool.get_key_buffer(layer_id).clone(),
+                        pool.get_value_buffer(layer_id).clone(),
+                        full_output.hidden_states.clone(),
+                        full_output.next_token_logits.clone(),
+                    )
+                if reference is None:
+                    result = self._npu_last_token_prefill(
+                        input_ids, positions, forward_batch, hidden_states
+                    )
+                else:
+                    with capture_mtp_stages(
+                        self.model,
+                        torch.arange(forward_batch.batch_size, device=input_ids.device),
+                    ) as actual_stages:
+                        result = self._npu_last_token_prefill(
+                            input_ids, positions, forward_batch, hidden_states
+                        )
+                    from sglang.srt.hardware_backend.npu.latency_validation import (
+                        compare_mtp_stages,
+                    )
+
+                    compare_mtp_stages(actual_stages, reference_stages)
+                if reference is not None:
+                    for actual, expected in zip(
+                        (
+                            pool.get_key_buffer(layer_id),
+                            pool.get_value_buffer(layer_id),
+                        ),
+                        reference[:2],
+                    ):
+                        torch.testing.assert_close(
+                            actual, expected, rtol=0, atol=0, equal_nan=True
+                        )
+                    # The one-query attention changes BF16 reduction tiling.
+                    # Check this operation locally; downstream FFN can amplify a
+                    # one-ULP perturbation, so record its drift instead of calling
+                    # the whole draft's hidden states bit-identical.
+                    torch.testing.assert_close(
+                        actual_stages["o_proj.input"],
+                        reference_stages["o_proj.input"],
+                        rtol=0.02,
+                        atol=0.02,
+                    )
+                    assert bool(torch.isfinite(result.hidden_states).all())
+                    logger.info(
+                        "NPU MTP differential check: KV exact, attention within BF16 tolerance, hidden max_abs=%s cosine=%s head_top1_equal=%s",
+                        float(
+                            (result.hidden_states.float() - reference[2].float())
+                            .abs()
+                            .max()
+                        ),
+                        float(
+                            torch.nn.functional.cosine_similarity(
+                                result.hidden_states.float(), reference[2].float()
+                            ).min()
+                        ),
+                        bool(
+                            torch.equal(
+                                result.next_token_logits.argmax(-1),
+                                reference[3].argmax(-1),
+                            )
+                        ),
+                    )
+                return result
 
             with get_global_expert_distribution_recorder().disable_this_region():
                 hidden_states = self.model(

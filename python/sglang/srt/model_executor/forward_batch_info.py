@@ -745,6 +745,8 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
 
     # For Qwen2-VL
     mrope_positions: torch.Tensor = None
+    # Preserve this runner/model handoff through registry dataclasses.replace.
+    _qwen_mtp_last_token_only: bool = False
 
     # For two-batch overlap
     tbo_parent_token_range: Optional[Tuple[int, int]] = None
@@ -1702,6 +1704,15 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
     def _compute_mrope_positions_extend(
         self, model_runner: ModelRunner, batch: ScheduleBatch
     ):
+        if (
+            _is_npu
+            and envs.SGLANG_NPU_MTP_KV_ONLY_PREFILL.get()
+            and all(mm is None for mm in batch.multimodal_inputs)
+        ):
+            self.mrope_positions = (
+                self.positions.unsqueeze(0).expand(3, -1).contiguous()
+            )
+            return
         seq_lens_cpu = self.seq_lens_cpu
         batch_size = seq_lens_cpu.shape[0]
         mm_inputs = batch.multimodal_inputs

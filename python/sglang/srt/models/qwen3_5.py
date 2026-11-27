@@ -1589,6 +1589,9 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
         hidden_states: torch.Tensor,
         forward_batch: ForwardBatch,
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, Optional[torch.Tensor]]:
+        prepared = getattr(forward_batch, "_qwen_mtp_qkv", None)
+        if prepared is not None:
+            return prepared
         if _is_cuda and self.attn_output_gate:
             return self.forward_prepare_cuda_fused(
                 positions=positions,

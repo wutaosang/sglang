@@ -1675,19 +1675,29 @@ class EAGLEWorkerV2(BaseSpecWorker):
             self.target_worker, supports_sharded_verify=self.topk == 1
         )
         # not in __init__, which the standalone and frozen-KV workers do not run
-        if (
-            self._draft_worker is not None
-            and envs.SGLANG_ENABLE_EAGLE_POST_VERIFY_CUDA_GRAPH.get()
+        if self._draft_worker is not None and (
+            envs.SGLANG_ENABLE_EAGLE_POST_VERIFY_CUDA_GRAPH.get()
+            or (_is_npu and envs.SGLANG_NPU_POST_VERIFY_GRAPH.get())
         ):
             self._init_post_verify_graphs()
 
     def _init_post_verify_graphs(self) -> None:
         # A key is captured at its first rounds, which attention-DP ranks do not reach
         # together, and a capture may end in a collective over the TP group.
-        if not _is_cuda or self.topk != 1 or get_parallel().attn_dp_enabled:
+        npu_supported = (
+            _is_npu
+            and envs.SGLANG_NPU_POST_VERIFY_GRAPH.get()
+            and get_parallel().tp_size == 1
+            and get_parallel().pp_size == 1
+        )
+        if (
+            not (_is_cuda or npu_supported)
+            or self.topk != 1
+            or get_parallel().attn_dp_enabled
+        ):
             logger.warning(
-                "The EAGLE post-verify graphs are disabled: they need CUDA, a chain "
-                "draft (topk 1) and no DP attention"
+                "The EAGLE post-verify graphs need CUDA or enabled NPU TP1/PP1, "
+                "a chain draft (topk 1) and no DP attention"
             )
             return
         # one stream of forced acceptance lengths, from which the post-verify
@@ -1883,7 +1893,10 @@ class EAGLEWorkerV2(BaseSpecWorker):
         batch_output.new_seq_lens = batch.seq_lens
         # Publish before draft_extend so the fence is at target-end.
         if on_publish is not None:
-            on_publish(batch_output.new_seq_lens)
+            if _is_npu and envs.SGLANG_NPU_EARLY_TOKEN_COPY.get():
+                on_publish(batch_output.new_seq_lens, result=batch_output)
+            else:
+                on_publish(batch_output.new_seq_lens)
 
         # A rank that does not host the draft (prefill-side PP builds it only on
         # the last stage) forwards the target's proxy tensors and stops here.

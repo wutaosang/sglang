@@ -139,6 +139,9 @@ class GenerationBatchResult:
 
     # For overlap scheduling
     copy_done: Optional[Union[torch.cuda.Event, HostCopyDone]] = None
+    # A token-only host snapshot taken at target-end, before draft KV preparation.
+    early_token_ids_cpu: Optional[torch.Tensor] = None
+    early_copy_done: Optional[Any] = None
     # Side-stream work still writing this batch's KV; copy_done is recorded after it.
     side_stream_done: Optional[torch.cuda.Event] = None
     # The unified pool's record of this forward; processing the result retires

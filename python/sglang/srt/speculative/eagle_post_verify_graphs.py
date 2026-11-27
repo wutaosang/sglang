@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
-"""SGLang's post-verify CUDA graphs for the EAGLE verify
-(SGLANG_ENABLE_EAGLE_POST_VERIFY_CUDA_GRAPH): sampling and acceptance, the commit
+"""SGLang's post-verify device graphs for the EAGLE verify
+(SGLANG_ENABLE_EAGLE_POST_VERIFY_CUDA_GRAPH / SGLANG_NPU_POST_VERIFY_GRAPH): sampling and acceptance, the commit
 outputs and, on a side stream, the mamba state commit, for every batch a graph can
 reproduce; any other batch runs SGLang's eager path.
 
@@ -40,7 +40,7 @@ _ONE_LAUNCH_LOAD = envs.SGLANG_OPT_SPEC_POST_VERIFY_ONE_LAUNCH_LOAD.get()
 
 
 class EaglePostVerifyGraphs:
-    """The verify's post-section in SGLang's own CUDA graphs, one set per key: batch
+    """The verify's post-section in SGLang's device graphs, one set per key: batch
     size, sampling mode, forced acceptance, tracking and the verify logits buffer."""
 
     def __init__(
@@ -58,6 +58,9 @@ class EaglePostVerifyGraphs:
             body=self._body,
             commit=self._commit,
             sim_rng=simulated_acc_len_rng,
+            device_type=(
+                "npu" if torch.device(target_worker.device).type == "npu" else "cuda"
+            ),
         )
 
     def run(
@@ -79,16 +82,42 @@ class EaglePostVerifyGraphs:
         )
         if key is None:
             return None
-        return self._graphs.run(
+        state_slots = self._verify_state_slots(batch)
+        validation = None
+        if (
+            self._graphs.device_type == "npu"
+            and envs.SGLANG_NPU_VALIDATE_LATENCY_PATHS.get()
+        ):
+            from sglang.srt.hardware_backend.npu.latency_validation import (
+                snapshot_verify_state,
+            )
+
+            validation = snapshot_verify_state(
+                self._target_worker, state_slots, len(batch.seq_lens)
+            )
+        outputs = self._graphs.run(
             key=key,
-            inputs=_post_verify_inputs(
-                batch, verify_input, self._verify_state_slots(batch)
-            ),
+            inputs=_post_verify_inputs(batch, verify_input, state_slots),
             make_slot=lambda staged: self._make_slot(
                 staged, batch, verify_input, logits_output, max_top_k
             ),
             sim_max_len=verify_input.max_tree_depth,
         )
+        if validation is not None and outputs is not None:
+            from sglang.srt.hardware_backend.npu.latency_validation import (
+                validate_verify_state,
+            )
+
+            self.join()
+            validate_verify_state(
+                validation,
+                self._target_worker,
+                batch,
+                verify_input,
+                logits_output,
+                outputs,
+            )
+        return outputs
 
     def _verify_state_slots(self, batch: ScheduleBatch) -> Optional[ForwardStateSlots]:
         """The verify forward's state slots, which the mamba commit writes; None
@@ -128,6 +157,10 @@ class EaglePostVerifyGraphs:
         from sglang.srt.speculative.spec_utils import SIMULATE_ACC_LEN
 
         info = batch.sampling_info
+        # Start with the deterministic NPU chain; sampled/adjusted rounds keep
+        # the existing eager implementation and its full sampling contract.
+        if self._graphs.device_type == "npu" and not info.is_all_greedy:
+            return None
         if (
             not can_run_cuda_graph
             or batch.forward_mode.is_idle()
@@ -150,6 +183,7 @@ class EaglePostVerifyGraphs:
             bool(info.is_all_greedy),
             bool(info.need_top_k_sampling),
             bool(info.need_top_p_sampling),
+            bool(batch.return_logprob),
             max_top_k,
             SIMULATE_ACC_LEN > 0,
             batch.mamba_track_indices is not None,
@@ -320,8 +354,17 @@ class _PostVerifyGraphs:
     and outputs alternate, so one round's outputs stay valid while the host consumes
     them; the mamba state commit replays on a side stream until join()."""
 
-    def __init__(self, *, body: Callable, commit: Callable, sim_rng: torch.Generator):
+    def __init__(
+        self,
+        *,
+        body: Callable,
+        commit: Callable,
+        sim_rng: torch.Generator,
+        device_type: str = "cuda",
+    ):
         self._body, self._commit = body, commit
+        self.device_type = device_type
+        self._device_module = torch.get_device_module(device_type)
         # forced acceptance lengths: the worker's one stream, from which SGLang's eager
         # verify draws too; once per round, whatever else uses the global RNG
         self._sim_rng = sim_rng
@@ -372,7 +415,7 @@ class _PostVerifyGraphs:
         slot.graph.replay()
         self._main_done.record()
         self._side_stream.wait_event(self._main_done)
-        with torch.cuda.stream(self._side_stream):
+        with self._device_module.stream(self._side_stream):
             slot.commit_graph.replay()
         self._commit_done.record(self._side_stream)
         self._commit_pending = True
@@ -380,7 +423,7 @@ class _PostVerifyGraphs:
 
     def join(self) -> None:
         if self._commit_pending:
-            torch.cuda.current_stream().wait_event(self._commit_done)
+            self._device_module.current_stream().wait_event(self._commit_done)
             self._commit_pending = False
 
     @staticmethod
@@ -444,10 +487,13 @@ class _PostVerifyGraphs:
 
     def _record_sim_done(self, turn: int) -> None:
         if self._sim_done[turn] is None:
-            self._sim_done[turn] = torch.cuda.Event()
+            self._sim_done[turn] = self._device_module.Event()
         self._sim_done[turn].record()
 
     def _capture(self, slot: SimpleNamespace) -> None:
+        if self.device_type == "npu":
+            self._capture_npu(slot)
+            return
         from sglang.srt.distributed.parallel_state import graph_capture
 
         if self._pool is None:
@@ -478,6 +524,29 @@ class _PostVerifyGraphs:
         logger.info(
             "Captured the EAGLE post-verify graphs for batch size %d",
             slot.num_requests,
+        )
+
+    def _capture_npu(self, slot: SimpleNamespace) -> None:
+        module = self._device_module
+        module.synchronize()
+        if self._pool is None:
+            self._pool = module.graph_pool_handle()
+            self._capture_stream = module.Stream()
+            self._side_stream = module.Stream()
+            self._main_done, self._commit_done = module.Event(), module.Event()
+        graph = module.NPUGraph()
+        self._capture_stream.wait_stream(module.current_stream())
+        with module.graph(graph, pool=self._pool, stream=self._capture_stream):
+            outputs = self._body(slot)
+        module.current_stream().wait_stream(self._capture_stream)
+        commit_graph = module.NPUGraph()
+        self._side_stream.wait_stream(module.current_stream())
+        with module.graph(commit_graph, pool=self._pool, stream=self._side_stream):
+            self._commit(slot, outputs)
+        module.current_stream().wait_stream(self._side_stream)
+        slot.graph, slot.commit_graph, slot.outputs = graph, commit_graph, outputs
+        logger.info(
+            "Captured NPU EAGLE post-verify graphs for batch size %d", slot.num_requests
         )
 
 

@@ -54,6 +54,7 @@ from sglang.kernels.ops.attention.kv_indices import (
 )
 from sglang.srt.configs.model_config import is_kimi_k31, is_qwen4_exp
 from sglang.srt.distributed.parallel_state import graph_capture
+from sglang.srt.environ import envs
 from sglang.srt.layers.attention.base_attn_backend import SharedReadEnds
 from sglang.srt.layers.attention.dsa.utils import is_dsa_enable_prefill_cp
 from sglang.srt.layers.cp.bcg import supports_prefill_cp_bcg
@@ -1568,6 +1569,29 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
         return True
 
     def can_run_graph(self, forward_batch: ForwardBatch) -> bool:
+        # KV-only MTP has a different body from a captured full draft prefill.
+        if getattr(forward_batch.spec_info, "kv_only", False):
+            return False
+        if (
+            self.model_runner.device == "npu"
+            and self.model_runner.is_draft_worker
+            and not self.enable_lora
+            and envs.SGLANG_NPU_MTP_KV_ONLY_PREFILL.get()
+            and forward_batch.forward_mode == ForwardMode.EXTEND
+            and len(forward_batch.input_ids) in self.capture_num_tokens
+            and len(forward_batch.input_ids) >= 512
+            and not forward_batch.contains_mm_inputs()
+            and forward_batch.input_embeds is None
+            and forward_batch.replace_embeds is None
+        ):
+            supports = getattr(
+                self.model_runner.model, "supports_forward_kv_only", None
+            )
+            if callable(supports) and supports(
+                kv_cache_dtype=self.model_runner.kv_cache_dtype
+            ):
+                forward_batch._qwen_mtp_last_token_only = True
+                return False
         # DP check: group verdict from the schedule-time all-gather
         # (min-reduced votes; also requires every rank to hold tokens).
         if (
