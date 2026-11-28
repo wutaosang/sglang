@@ -2395,16 +2395,6 @@ class Scheduler(
     def _apply_war_barrier(self):
         # WAR: keep later schedule_stream writes behind this forward's shared reads.
         # Clearing matters: a phase that skips the publish then falls back to coarse.
-        if (
-            _is_npu
-            and envs.SGLANG_NPU_EARLY_TOKEN_COPY.get()
-            and self.cur_batch_for_debug is not None
-            and self.cur_batch_for_debug.forward_mode.is_extend()
-        ):
-            # Early host output does not mean draft KV writes have completed.
-            # Fence prefill slot reuse; leave the existing decode overlap intact.
-            self.schedule_stream.wait_stream(self.forward_stream)
-            return
         if not self._war_barrier_enabled:
             return
         runner = self.model_worker.last_shared_read_runner
@@ -2559,9 +2549,7 @@ class Scheduler(
 
         # A prefill's result goes early, for its TTFT. Under DP, is_extend_in_batch is
         # synced, so all ranks decide the same (no deadlock).
-        if envs.SGLANG_DISABLE_OVERLAP_AFTER_PREFILL.get() or (
-            _is_npu and envs.SGLANG_NPU_EARLY_TOKEN_COPY.get()
-        ):
+        if envs.SGLANG_DISABLE_OVERLAP_AFTER_PREFILL.get():
             if self.require_mlp_sync:
                 last_batch_is_extend = last_batch.is_extend_in_batch
             else:
@@ -5816,7 +5804,7 @@ class Scheduler(
                         fwd_kwargs = {}
                         if not batch.spec_algorithm.is_none():
                             fwd_kwargs["on_publish"] = partial(
-                                self._publish_spec_output, batch, future_indices
+                                self.future_map.publish, future_indices
                             )
                             # Grammar-overlap-capable workers advance the grammar FSM
                             # inside verify() before building the bitmask; hand them the
@@ -6184,47 +6172,6 @@ class Scheduler(
             return_hidden_states=batch.return_hidden_states,
         )
 
-    def _publish_spec_output(self, batch, future_indices, new_seq_lens, *, result=None):
-        self.future_map.publish(future_indices, new_seq_lens)
-        if result is None or not (_is_npu and envs.SGLANG_NPU_EARLY_TOKEN_COPY.get()):
-            return
-        # Optional outputs remain on the established full-forward copy path.
-        logits = result.logits_output
-        if (
-            batch.return_logprob
-            or batch.return_hidden_states
-            or not result.has_sampled_token_ids
-            or any(
-                getattr(result, name) is not None
-                for name in (
-                    "routed_experts_output",
-                    "indexer_topk_output",
-                    "kv_weight_version_record",
-                    "expert_distribution_metrics",
-                    "forward_auxiliary_output",
-                )
-            )
-            or (
-                logits is not None
-                and (
-                    logits.auxiliary_device_output is not None
-                    or logits.sampling_mask_output is not None
-                )
-            )
-        ):
-            return
-        from sglang.srt.utils.device import async_d2h
-
-        ready = self.device_module.Event()
-        ready.record(self.forward_stream)
-        self.copy_stream.wait_event(ready)
-        with self.copy_stream_ctx:
-            result.early_token_ids_cpu = async_d2h(result.next_token_ids)
-            result.early_copy_done = self.device_module.Event()
-            result.early_copy_done.record()
-        # Protect graph-owned token storage from a subsequent target replay.
-        self.forward_stream.wait_event(result.early_copy_done)
-
     def _copy_result_to_cpu(
         self, batch_result: GenerationBatchResult, batch: ScheduleBatch
     ) -> None:
@@ -6239,10 +6186,6 @@ class Scheduler(
             return_logprob=batch.return_logprob,
             return_hidden_states=batch.return_hidden_states,
         )
-        if batch_result.early_copy_done is not None:
-            batch_result.next_token_ids = batch_result.early_token_ids_cpu
-            batch_result.copy_done = batch_result.early_copy_done
-            return
         self.copy_stream.wait_stream(self.forward_stream)
         if batch_result.side_stream_done is not None:
             self.copy_stream.wait_event(batch_result.side_stream_done)

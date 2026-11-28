@@ -1,4 +1,4 @@
-"""Run on one Ascend device: stream ordering, relay snapshots and graph lifetime."""
+"""Run on one Ascend device: relay snapshots and graph lifetime."""
 
 import unittest
 from types import SimpleNamespace
@@ -127,36 +127,6 @@ class TestNPULatency(unittest.TestCase):
                 value, expected = previous
                 torch.testing.assert_close(value.cpu(), expected)
             previous = (outputs[3], outputs[3].cpu().clone())
-
-    def test_early_token_copy_precedes_storage_reuse(self):
-        from sglang.srt.layers.logits_processor import LogitsProcessorOutput
-        from sglang.srt.managers.scheduler import Scheduler
-        from sglang.srt.managers.utils import GenerationBatchResult
-
-        scheduler = Scheduler.__new__(Scheduler)
-        scheduler.device_module = torch.npu
-        scheduler.forward_stream, scheduler.copy_stream = (
-            torch.npu.Stream(),
-            torch.npu.Stream(),
-        )
-        scheduler.copy_stream_ctx = torch.npu.stream(scheduler.copy_stream)
-        scheduler.future_map = SimpleNamespace(publish=lambda *args: None)
-        batch = SimpleNamespace(return_logprob=False, return_hidden_states=False)
-        with (
-            envs.SGLANG_NPU_EARLY_TOKEN_COPY.override(True),
-            torch.npu.stream(scheduler.forward_stream),
-        ):
-            tokens = torch.tensor([3, 17], device="npu")
-            result = GenerationBatchResult(
-                next_token_ids=tokens,
-                logits_output=LogitsProcessorOutput(next_token_logits=None),
-            )
-            scheduler._publish_spec_output(batch, None, None, result=result)
-            tokens.fill_(999)
-            scheduler._copy_result_to_cpu(result, batch)
-        result.copy_done.synchronize()
-        torch.testing.assert_close(result.next_token_ids, torch.tensor([3, 17]))
-        self.assertTrue(result.next_token_ids.is_cpu)
 
 
 if __name__ == "__main__":

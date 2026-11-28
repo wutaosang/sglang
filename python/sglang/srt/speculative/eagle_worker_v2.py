@@ -1893,10 +1893,7 @@ class EAGLEWorkerV2(BaseSpecWorker):
         batch_output.new_seq_lens = batch.seq_lens
         # Publish before draft_extend so the fence is at target-end.
         if on_publish is not None:
-            if _is_npu and envs.SGLANG_NPU_EARLY_TOKEN_COPY.get():
-                on_publish(batch_output.new_seq_lens, result=batch_output)
-            else:
-                on_publish(batch_output.new_seq_lens)
+            on_publish(batch_output.new_seq_lens)
 
         # A rank that does not host the draft (prefill-side PP builds it only on
         # the last stage) forwards the target's proxy tensors and stops here.
