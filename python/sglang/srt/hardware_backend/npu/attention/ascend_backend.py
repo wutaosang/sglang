@@ -472,10 +472,19 @@ class AscendAttnBackend(AttentionBackend):
             get_bool_env_var("SGLANG_NPU_USE_FIAS_V2_BSND", "False")
             and model_runner.spec_algorithm.is_dspark()
         )
-        self.use_paged_mtp = (
-            get_bool_env_var("ASCEND_USE_PAGED_MTP", "False")
-            and model_runner.is_draft_worker
-            and model_runner.spec_algorithm.is_dspark()
+        self.paged_mtp_nextn = (
+            get_bool_env_var("SGLANG_NPU_PAGED_MTP_NEXTN", "False")
+            and model_runner.spec_algorithm.is_eagle()
+            and get_spec().speculative_eagle_topk == 1
+            and not self.use_mla
+            and not self.use_quant_flash_attn
+            and self.dcp_size == 1
+            and not model_runner.is_hybrid_swa
+            and self.kv_cache_dtype in (torch.float16, torch.bfloat16)
+        )
+        self.use_paged_mtp = get_bool_env_var("ASCEND_USE_PAGED_MTP", "False") and (
+            (model_runner.is_draft_worker and model_runner.spec_algorithm.is_dspark())
+            or self.paged_mtp_nextn
         )
         self.use_flash_mla = (
             self.use_mla
@@ -754,6 +763,24 @@ class AscendAttnBackend(AttentionBackend):
                 extend_seq_lens=forward_batch.extend_seq_lens,
             )
             return
+        if (
+            self.use_paged_mtp
+            and self.paged_mtp_nextn
+            and (
+                forward_batch.forward_mode.is_decode_or_idle()
+                or forward_batch.forward_mode.is_target_verify()
+                or forward_batch.forward_mode.is_draft_extend_v2()
+            )
+        ):
+            metadata = self.forward_metadata
+            metadata.seq_lens = torch.empty_like(
+                forward_batch.seq_lens, dtype=torch.int32
+            )
+            self._prepare_paged_mtp_metadata(
+                metadata, forward_batch.seq_lens, forward_batch.forward_mode
+            )
+            self.graph_mode = False
+            return
         if forward_batch.extend_seq_lens is not None:
             self.forward_metadata.extend_seq_lens = forward_batch.extend_seq_lens
             self.forward_metadata.extend_seq_lens_cpu_int = (
@@ -974,7 +1001,7 @@ class AscendAttnBackend(AttentionBackend):
             self._prepare_flash_mla_metadata(
                 self.forward_metadata, forward_batch.seq_lens
             )
-        elif self.use_paged_mtp:
+        elif self.use_paged_mtp and not self.paged_mtp_nextn:
             self._prepare_paged_mtp_metadata(
                 self.forward_metadata, forward_batch.seq_lens
             )
@@ -1458,7 +1485,7 @@ class AscendAttnBackend(AttentionBackend):
             elif self.use_flash_mla:
                 self._prepare_flash_mla_metadata(metadata, seq_lens[:bs])
             else:
-                self._prepare_paged_mtp_metadata(metadata, seq_lens[:bs])
+                self._prepare_paged_mtp_metadata(metadata, seq_lens[:bs], forward_mode)
             self.forward_metadata = metadata
             return
 
@@ -1563,10 +1590,21 @@ class AscendAttnBackend(AttentionBackend):
         self,
         metadata: ForwardMetadata,
         prefix_lens: torch.Tensor,
+        forward_mode: Optional[ForwardMode] = None,
     ):
         width = self.speculative_num_draft_tokens
+        offset = width
+        if self.paged_mtp_nextn:
+            # NEXTN draft consumes one new KV token per inner decode step.
+            # Draft-extend already receives lengths including the entire block.
+            if forward_mode.is_decode():
+                width = 1
+                offset = self.speculative_step_id + 1
+            elif forward_mode.is_draft_extend_v2():
+                offset = 0
+        metadata.uniform_query_len = width
         # Preserve input prefixes and captured buffer addresses.
-        metadata.seq_lens.copy_(torch.where(prefix_lens > 0, prefix_lens + width, 0))
+        metadata.seq_lens.copy_(torch.where(prefix_lens > 0, prefix_lens + offset, 0))
         if metadata.cu_seqlens_q is None:
             metadata.cu_seqlens_q = torch.arange(
                 0,
@@ -1577,11 +1615,14 @@ class AscendAttnBackend(AttentionBackend):
             )
 
     def _forward_paged_mtp(self, q, layer, forward_batch, sinks):
+        assert sinks is None, "paged MTP does not support attention sinks"
+        assert not getattr(layer, "is_cross_attention", False)
+        assert layer.qk_head_dim == layer.v_head_dim
         query = q.reshape(-1, layer.tp_q_head_num, layer.qk_head_dim).contiguous()
         padded_tokens = query.shape[0]
         if not self.graph_mode:
             query = query[: forward_batch.global_num_token_non_padded_cpu]
-        width = self.speculative_num_draft_tokens
+        width = self.forward_metadata.uniform_query_len
         bs = query.shape[0] // width
         output = self.paged_mtp_attention_decode(
             query=query,
@@ -3411,7 +3452,12 @@ class AscendAttnBackend(AttentionBackend):
         if self.use_flash_mla and forward_batch.forward_mode.is_target_verify():
             return self._forward_flash_mla(q, q_rope, layer, forward_batch)
 
-        if self.use_paged_mtp:
+        if self.use_paged_mtp and (
+            not self.paged_mtp_nextn
+            or forward_batch.forward_mode.is_decode_or_idle()
+            or forward_batch.forward_mode.is_target_verify()
+            or forward_batch.forward_mode.is_draft_extend_v2()
+        ):
             return self._forward_paged_mtp(q, layer, forward_batch, sinks)
 
         modelslim_kv_scheme = getattr(layer, "scheme", None)
@@ -4275,6 +4321,11 @@ class AscendAttnBackend(AttentionBackend):
         **kwargs,
     ):
         return_softmax_lse = kwargs.pop("return_softmax_lse", False)
+        if self.use_paged_mtp and self.paged_mtp_nextn:
+            assert not return_softmax_lse and slopes is None
+            return self.forward_mtp(
+                q, k, v, layer, forward_batch, save_kv_cache, sinks=sinks
+            )
         if is_mla_preprocess_enabled() and self.use_mla:
             # DSA callers set save_kv_cache based on whether preprocessing was used.
             # Only override it for the existing non-sparse MLA path.

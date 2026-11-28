@@ -11,6 +11,7 @@ from sgl_kernel_npu.operators.attention.gdn.gdn_utils import prepare_chunk_indic
 from sgl_kernel_npu.operators.mamba import causal_conv1d
 from sgl_kernel_npu.operators.norm import l2norm_fwd
 
+from sglang.srt.environ import envs
 from sglang.srt.hardware_backend.npu.attention.ascend_hybrid_linear_attn_backend import (
     AscendMambaAttnBackendBase,
 )
@@ -21,11 +22,21 @@ from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_executor.forward_mode import ForwardMode
 from sglang.srt.model_executor.model_runner import ModelRunner
 from sglang.srt.speculative.eagle_info import EagleDraftInput, EagleVerifyInput
+from sglang.srt.utils.common import get_bool_env_var
 
 
 class AscendGDNAttnBackend(AscendMambaAttnBackendBase):
     def __init__(self, model_runner: ModelRunner):
         super().__init__(model_runner)
+        if (
+            get_bool_env_var("ASCEND_USE_PAGED_MTP", "False")
+            and get_bool_env_var("SGLANG_NPU_PAGED_MTP_NEXTN", "False")
+            and not envs.SGLANG_NPU_ATTN_BACKEND_NEEDS_CPU_SEQ_LENS.get()
+            and not self.state_pool.enable_linear_replayssm
+        ):
+            # The graph runner supplies padding counts; GDN otherwise consumes
+            # device state/query indices, not the attention KV length mirror.
+            self.needs_cpu_seq_lens = False
         self.conv_states_shape = torch.Size(
             (
                 *model_runner.req_to_token_pool.mamba_pool.mamba_cache.conv[0].shape[

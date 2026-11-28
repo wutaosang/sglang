@@ -41,6 +41,7 @@ def backend():
     obj.use_quant_flash_attn = False
     obj.use_flash_mla = obj.use_mla = True
     obj.use_paged_mtp = False
+    obj.paged_mtp_nextn = False
     obj.use_dsa = False
     obj.dense_mla_dcp_target = obj.dsa_dcp_target = False
     obj.dcp_size, obj.dcp_rank = 1, 0

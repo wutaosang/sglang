@@ -40,11 +40,54 @@ def source_method(path, cls, method, namespace):
     return namespace[method]
 
 
+@pytest.mark.parametrize(
+    "mode,width", [(ForwardMode.DECODE, 1), (ForwardMode.TARGET_VERIFY, 4)]
+)
+def test_gdn_graph_padding_uses_runner_count_without_cpu_lengths(mode, width):
+    replay = source_method(
+        "hardware_backend/npu/attention/ascend_hybrid_linear_attn_backend.py",
+        "AscendMambaAttnBackendBase",
+        "_replay_metadata",
+        {"torch": torch, "ForwardMetadata": SimpleNamespace},
+    )
+    obj = SimpleNamespace(
+        req_to_token_pool=SimpleNamespace(get_mamba_indices=lambda rows: rows.clone()),
+        state_indices_list=[None, None, None, torch.empty(4, dtype=torch.int32)],
+        state_indices_list_gdn=[None, None, None, torch.empty(16, dtype=torch.int32)],
+        query_start_loc_list=[None, None, None, torch.empty(5, dtype=torch.int32)],
+        cached_cuda_graph_decode_query_start_loc=torch.arange(5),
+        cached_cuda_graph_verify_query_start_loc=torch.arange(0, 20, 4),
+    )
+    rows = torch.tensor([1, 2, 3, 4], dtype=torch.int32)
+    with patch.object(
+        torch.Tensor, "cpu", side_effect=AssertionError("unexpected D2H")
+    ):
+        metadata = replay(
+            obj,
+            4,
+            rows,
+            mode,
+            SimpleNamespace(topk=1, draft_token_num=4),
+            None,
+            num_padding=1,
+        )
+    assert metadata.query_start_loc.tolist() == [
+        0,
+        width,
+        2 * width,
+        3 * width,
+        3 * width,
+    ]
+    assert metadata.mamba_cache_indices.tolist() == [1, 2, 3, 0]
+    assert rows.tolist() == [1, 2, 3, 0]
+
+
 @pytest.fixture
 def backend():
     obj = mod.AscendAttnBackend.__new__(mod.AscendAttnBackend)
     obj.use_quant_flash_attn = False
     obj.use_paged_mtp = True
+    obj.paged_mtp_nextn = False
     obj.paged_mtp_attention_decode = Mock()
     obj.use_flash_mla = obj.use_mla = False
     obj.dense_mla_dcp_target = obj.dsa_dcp_target = False
@@ -93,6 +136,69 @@ def batch(lengths=(127, 0)):
         ),
         global_num_token_non_padded_cpu=len(lengths) * 7,
     )
+
+
+@pytest.mark.parametrize("graph", [False, True])
+@pytest.mark.parametrize("dtype", [torch.int32, torch.int64])
+@pytest.mark.parametrize(
+    "mode,step,width,expected",
+    [
+        (ForwardMode.DECODE, 0, 1, [128, 0]),
+        (ForwardMode.DECODE, 1, 1, [129, 0]),
+        (ForwardMode.TARGET_VERIFY, 0, 4, [131, 0]),
+        (ForwardMode.DRAFT_EXTEND_V2, 0, 4, [127, 0]),
+    ],
+)
+def test_nextn_device_lengths_and_dispatch_without_host_mirror(
+    backend, graph, dtype, mode, step, width, expected
+):
+    backend.paged_mtp_nextn = True
+    backend.speculative_num_draft_tokens = 4
+    backend.speculative_step_id = step
+    fb = batch()
+    fb.forward_mode = mode
+    fb.seq_lens = fb.seq_lens.to(dtype)
+    fb.spec_info.draft_token_num = 4
+    fb.spec_algorithm.is_dflash_family = lambda: False
+    fb.global_num_token_non_padded_cpu = 2 * width
+    fb.extend_seq_lens = torch.tensor([width, width], dtype=torch.int32)
+    layer = SimpleNamespace(
+        layer_id=0,
+        tp_q_head_num=4,
+        tp_k_head_num=2,
+        tp_v_head_num=2,
+        qk_head_dim=16,
+        v_head_dim=16,
+        scaling=0.25,
+        attn_type=mod.AttentionType.DECODER,
+    )
+    kernel = Mock(side_effect=lambda **kw: torch.ones_like(kw["query"]))
+    with (
+        patch.object(torch.Tensor, "cpu", side_effect=AssertionError("unexpected D2H")),
+        patch.object(torch.Tensor, "item", side_effect=AssertionError("scalar sync")),
+        patch.object(backend, "paged_mtp_attention_decode", kernel),
+    ):
+        if graph:
+            backend.init_forward_metadata_out_graph(fb, in_capture=True)
+            metadata = backend.forward_metadata
+            pointer = metadata.seq_lens.data_ptr()
+            backend.init_forward_metadata_out_graph(fb)
+            assert metadata.seq_lens.data_ptr() == pointer
+        else:
+            backend.init_forward_metadata(fb)
+            metadata = backend.forward_metadata
+        q = torch.zeros(2 * width, 4, 16)
+        if mode.is_decode():
+            result = backend.forward_decode(q, None, None, layer, fb, False)
+        else:
+            result = backend.forward_mtp(q, None, None, layer, fb, False)
+    assert metadata.seq_lens.tolist() == expected
+    assert metadata.cu_seqlens_q.tolist() == [0, width, 2 * width]
+    assert metadata.seq_lens.data_ptr() != fb.seq_lens.data_ptr()
+    assert fb.seq_lens.tolist() == [127, 0]
+    assert result.shape == (2 * width, 64)
+    assert kernel.call_args.kwargs["gamma"] == width
+    assert kernel.call_args.kwargs["seq_lens"].tolist() == expected
 
 
 def test_eager_metadata_uses_valid_device_end_and_preserves_prefix(backend):
