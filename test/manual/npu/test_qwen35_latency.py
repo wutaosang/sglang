@@ -1,4 +1,4 @@
-"""Run on one Ascend device: relay snapshots and graph lifetime."""
+"""Run on one Ascend device: verify outputs and graph lifetime."""
 
 import unittest
 from types import SimpleNamespace
@@ -7,38 +7,11 @@ import torch
 import torch_npu  # noqa: F401
 
 from sglang.kernels.ops.speculative.eagle import prepare_verify_commit_outputs
-from sglang.srt.environ import envs
-from sglang.srt.managers.overlap_utils import FutureMap
 from sglang.srt.speculative.eagle_post_verify_graphs import _PostVerifyGraphs
-from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 
 
 @unittest.skipUnless(torch.npu.is_available(), "Ascend NPU required")
 class TestNPULatency(unittest.TestCase):
-    def test_publish_snapshots_survive_ring_and_request_reuse(self):
-        pool = SimpleNamespace(
-            req_to_token=torch.zeros((8, 16), device="npu", dtype=torch.int32)
-        )
-        with envs.SGLANG_NPU_ASYNC_SEQ_LENS.override(True):
-            relay = FutureMap(torch.device("npu"), SpeculativeAlgorithm.EAGLE, pool)
-        previous = None
-        for turn in range(30):
-            rows = torch.tensor([1, 3, 7] if turn % 2 else [2, 4, 6])
-            device_rows = rows.to("npu")
-            lengths = torch.tensor([turn + 1, turn + 5, turn + 19])
-            relay.publish(device_rows, lengths.to("npu"))
-            batch = SimpleNamespace(
-                spec_info=SimpleNamespace(future_indices=device_rows),
-                req_pool_indices_cpu=rows,
-            )
-            relay.resolve_seq_lens_cpu(batch)
-            torch.testing.assert_close(batch.seq_lens_cpu, lengths)
-            torch.testing.assert_close(batch.seq_lens.cpu(), lengths)
-            if previous is not None:
-                snapshot, expected = previous
-                torch.testing.assert_close(snapshot, expected)
-            previous = (batch.seq_lens_cpu, lengths)
-
     def test_commit_outputs_match_reference(self):
         for bs in [1, 2, 3, 4, 16]:
             width = 4

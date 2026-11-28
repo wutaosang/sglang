@@ -362,25 +362,6 @@ class FutureMap:
         else:
             self.new_seq_lens_cpu_pinned = None
             self.fwd_prepare_d2h_stream = None
-        self._npu_seq_lens_ring = None
-        self._npu_seq_lens_pending = None
-        self._npu_seq_lens_turn = 0
-        if _is_npu and needs_cpu_seq_lens and envs.SGLANG_NPU_ASYNC_SEQ_LENS.get():
-            from sglang.srt.utils.device import is_pin_memory_available
-
-            if is_pin_memory_available(device):
-                module = torch.get_device_module(device)
-                self.fwd_prepare_d2h_stream = module.Stream()
-                self.new_seq_lens_cpu_pinned = torch.empty(
-                    (self.req_pool_size,), dtype=torch.int64, pin_memory=True
-                )
-                self._npu_seq_lens_ring = [
-                    (
-                        torch.empty_like(self.new_seq_lens_cpu_pinned, pin_memory=True),
-                        module.Event(),
-                    )
-                    for _ in range(3)
-                ]
         self.need_topk = False
         self.need_hidden_states = False
         self.topk_p_buf = None
@@ -743,16 +724,6 @@ class FutureMap:
                 _assert_nonneg_and_invalidate(batch.seq_lens, self.new_seq_lens_buf, fi)
             return
 
-        if self._npu_seq_lens_pending is not None:
-            host, done = self._npu_seq_lens_pending
-            done.synchronize()
-            # Advanced indexing owns the CPU snapshot: ring reuse cannot alter it.
-            batch.seq_lens_cpu = host[batch.req_pool_indices_cpu]
-            batch.seq_lens_sum = int(batch.seq_lens_cpu.sum())
-            if _DEBUG_ASSERT:
-                _assert_nonneg_and_invalidate(batch.seq_lens, self.new_seq_lens_buf, fi)
-            return
-
         if self.fwd_prepare_d2h_stream is None or self.publish_ready is None:
             batch.seq_lens_cpu = batch.seq_lens.cpu()  # bootstrap / non-CUDA
             batch.seq_lens_sum = int(batch.seq_lens_cpu.sum())
@@ -784,11 +755,6 @@ class FutureMap:
         indices = future_indices
         if indices.shape[0] == 0:
             return  # DP idle
-        if self._npu_seq_lens_pending is not None:
-            # Do not overwrite the device relay while the previous D2H reads it.
-            torch.get_device_module(self.device).current_stream().wait_event(
-                self._npu_seq_lens_pending[1]
-            )
         relay = self._relay
         if relay is not None and new_seq_lens is relay.published_seq_lens:
             relay.published_seq_lens = None
@@ -805,17 +771,6 @@ class FutureMap:
                 self.publish_ready = torch.get_device_module(self.device).Event()
             self.publish_ready.record()
             self._publish_fresh = True
-            if self._npu_seq_lens_ring is not None:
-                host, done = self._npu_seq_lens_ring[self._npu_seq_lens_turn]
-                self._npu_seq_lens_turn = (self._npu_seq_lens_turn + 1) % len(
-                    self._npu_seq_lens_ring
-                )
-                module = torch.get_device_module(self.device)
-                self.fwd_prepare_d2h_stream.wait_event(self.publish_ready)
-                with module.stream(self.fwd_prepare_d2h_stream):
-                    host.copy_(self.new_seq_lens_buf, non_blocking=True)
-                    done.record()
-                self._npu_seq_lens_pending = (host, done)
         if publish_confidence:
             self.confidence_relay.issue_ring_copy(
                 stream=self.fwd_prepare_d2h_stream,
